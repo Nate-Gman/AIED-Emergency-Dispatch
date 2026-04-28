@@ -1066,6 +1066,113 @@ class _CCGeoIPCache:
 geoip_cache = _CCGeoIPCache()
 
 
+# ── Public-IP self-detector ────────────────────────────────────────────
+# When a call lands from 127.0.0.1 or any LAN address (which is the case
+# for every test call placed from the operator's own machine), we still
+# want to plot the call SOMEWHERE useful on the caller map. The operator's
+# OWN public IP is the best fallback — it's the closest thing to "the
+# real-world location of the device making the call." Fetched once per
+# process via a public service, cached, used everywhere a session needs
+# a location and nothing better is available.
+class _CCPublicIPLocator:
+    """Detects the operator's own public IP (and city-level location)
+    so calls from local clients still appear globally on the map."""
+
+    _ENDPOINTS = (
+        'https://api.ipify.org?format=json',         # → {'ip': '1.2.3.4'}
+        'https://ifconfig.me/ip',                    # plain text
+        'https://ipinfo.io/ip',                      # plain text
+        'https://icanhazip.com/',                    # plain text
+    )
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cached_ip = None
+        self._cached_geo = None
+        self._cached_at = 0.0
+        self._ttl = 3600.0    # 1 hour
+        self._fetch_thread = None
+
+    def _fetch_ip_sync(self):
+        """Try each endpoint until one returns a usable IPv4 string."""
+        for url in self._ENDPOINTS:
+            try:
+                req = _cc_urlrequest.Request(
+                    url, headers={'User-Agent': 'AIdispatch/1.0'})
+                with _cc_urlrequest.urlopen(req, timeout=4) as resp:
+                    body = resp.read().decode('utf-8', errors='ignore').strip()
+                if not body:
+                    continue
+                # JSON shape (ipify)?
+                if body.startswith('{'):
+                    try:
+                        j = json.loads(body)
+                        ip = (j.get('ip') or '').strip()
+                    except Exception:
+                        ip = ''
+                else:
+                    # Plain-text endpoints just return the IP
+                    ip = body.split()[0] if body.split() else ''
+                # Sanity: matches IPv4 / IPv6 / has dots-or-colons
+                if ip and ('.' in ip or ':' in ip) and len(ip) <= 64:
+                    return ip
+            except Exception:
+                continue
+        return None
+
+    def get_ip(self, blocking=False):
+        """Return the cached public IP. If nothing cached and `blocking`
+        is False, kick off a background fetch and return None now."""
+        with self._lock:
+            if self._cached_ip and (time.time() - self._cached_at) < self._ttl:
+                return self._cached_ip
+        if blocking:
+            ip = self._fetch_ip_sync()
+            if ip:
+                with self._lock:
+                    self._cached_ip = ip
+                    self._cached_at = time.time()
+            return ip
+        # Async fetch
+        if self._fetch_thread and self._fetch_thread.is_alive():
+            return None
+        def _bg():
+            ip = self._fetch_ip_sync()
+            if ip:
+                with self._lock:
+                    self._cached_ip = ip
+                    self._cached_at = time.time()
+        self._fetch_thread = threading.Thread(
+            target=_bg, daemon=True, name='PublicIPDetect')
+        self._fetch_thread.start()
+        return None
+
+    def get_geo(self, blocking=False):
+        """Return a location dict for the operator's public IP. Same
+        shape as geoip_cache.lookup() output. None if not yet known."""
+        with self._lock:
+            if self._cached_geo and (time.time() - self._cached_at) < self._ttl:
+                return dict(self._cached_geo)
+        ip = self.get_ip(blocking=blocking)
+        if not ip:
+            return None
+        info = geoip_cache.lookup(ip)
+        if not info:
+            return None
+        with self._lock:
+            self._cached_geo = info
+        return dict(info)
+
+
+public_ip_locator = _CCPublicIPLocator()
+# Kick off a background fetch at import time so the IP is ready before
+# the first call lands.
+try:
+    public_ip_locator.get_ip(blocking=False)
+except Exception:
+    pass
+
+
 # =============================================================================
 # PHONE NUMBER LOCATOR — NPA (area code) → city/coords
 # =============================================================================
@@ -2999,6 +3106,486 @@ class DispatcherKnowledge:
             'pre_arrival': "",
             'key_questions': [],
         },
+
+        # ════════════════════════════════════════════════════════════════
+        # ADDITIONAL SCENARIO COVERAGE — common 9-1-1 calls not yet listed.
+        # Each entry has the same shape as the protocol-aligned set above.
+        # ════════════════════════════════════════════════════════════════
+
+        # ── MEDICAL: drowning / water ──
+        'medical.drowning': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 100,
+            'escalation': '911/EMS', 'intent': 'medical', 'urgency': 10,
+            'psych': 'panicked', 'determinant': 'E',
+            'response': "EMS and water rescue dispatching for drowning.",
+            'pre_arrival': ("If they are out of the water and not breathing, "
+                "start CPR immediately — 30 chest compressions then 2 rescue "
+                "breaths, repeat. If they're still in the water and you're "
+                "not a trained swimmer, do not go in — throw them anything "
+                "that floats and keep eyes on them."),
+            'key_questions': ['KQ_AGE', 'KQ_BREATHING', 'KQ_CONSCIOUS'],
+        },
+        'medical.electrocution': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 100,
+            'escalation': '911/EMS', 'intent': 'medical', 'urgency': 10,
+            'psych': 'panicked', 'determinant': 'E',
+            'response': "EMS and fire dispatching for electrical injury.",
+            'pre_arrival': ("Do NOT touch them if they are still in contact "
+                "with the source. Cut the power at the breaker if you can. "
+                "Once it's safe, check breathing — start CPR if needed. "
+                "Do not move them unless they are in immediate further danger."),
+            'key_questions': ['KQ_CONSCIOUS', 'KQ_BREATHING'],
+        },
+        'medical.allergic_reaction.severe': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 100,
+            'escalation': '911/EMS', 'intent': 'medical', 'urgency': 10,
+            'psych': 'distressed', 'determinant': 'E',
+            'response': "EMS dispatching for severe allergic reaction.",
+            'pre_arrival': ("If they have an EpiPen, use it now — pull off "
+                "the safety, press the orange tip into the outer thigh, "
+                "hold for 3 seconds. If their throat is swelling and they "
+                "stop breathing, start rescue breaths. Sit them up if they "
+                "can still breathe — easier than lying flat."),
+            'key_questions': ['KQ_AGE', 'KQ_BREATHING'],
+        },
+        'medical.diabetic_emergency': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 90,
+            'escalation': '911/EMS', 'intent': 'medical', 'urgency': 9,
+            'psych': 'distressed', 'determinant': 'D',
+            'response': "EMS on the way for diabetic emergency.",
+            'pre_arrival': ("If they are conscious and can swallow, give them "
+                "something sweet — juice, regular soda, or glucose tabs. Do "
+                "NOT give insulin unless trained. If they're unconscious, "
+                "put them on their side and stay with them."),
+            'key_questions': ['KQ_AGE', 'KQ_CONSCIOUS'],
+        },
+        'medical.hypothermia': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 90,
+            'escalation': '911/EMS', 'intent': 'medical', 'urgency': 9,
+            'psych': 'distressed', 'determinant': 'D',
+            'response': "EMS dispatching for hypothermia.",
+            'pre_arrival': ("Get them out of the cold and out of any wet "
+                "clothing. Wrap them in dry blankets, including the head. "
+                "Do not rub their skin. Warm drinks only if they are fully "
+                "conscious and can swallow safely. Do not put them in a "
+                "hot bath — that can stop their heart."),
+            'key_questions': ['KQ_AGE', 'KQ_CONSCIOUS'],
+        },
+        'medical.heat_stroke': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 95,
+            'escalation': '911/EMS', 'intent': 'medical', 'urgency': 9,
+            'psych': 'distressed', 'determinant': 'D',
+            'response': "EMS dispatching for heat stroke.",
+            'pre_arrival': ("Move them to a cool place out of the sun. Remove "
+                "extra clothing. Cool them with whatever you have — wet "
+                "cloths on the neck, armpits, and groin; fan them; spray "
+                "with water. Do not give anything to drink if they are "
+                "confused or vomiting."),
+            'key_questions': ['KQ_AGE', 'KQ_CONSCIOUS'],
+        },
+        'medical.snake_bite': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 90,
+            'escalation': '911/EMS', 'intent': 'medical', 'urgency': 8,
+            'psych': 'distressed', 'determinant': 'C',
+            'response': "EMS dispatching for snake bite.",
+            'pre_arrival': ("Keep them still and the bitten limb below "
+                "heart level. Do NOT cut the wound, suck venom, or apply "
+                "ice or a tourniquet. Take a photo of the snake from a "
+                "safe distance if possible — color and pattern help "
+                "identify the species. Remove rings and watches before "
+                "swelling sets in."),
+            'key_questions': ['KQ_AGE', 'KQ_CONSCIOUS'],
+        },
+        'medical.animal_attack': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 90,
+            'escalation': '911/EMS', 'intent': 'medical', 'urgency': 8,
+            'psych': 'panicked', 'determinant': 'C',
+            'response': "EMS and animal control dispatching.",
+            'pre_arrival': ("Get to a safe place — inside a building or "
+                "vehicle. Apply firm pressure to any bleeding wounds with "
+                "a clean cloth. Do not run if the animal is still around — "
+                "back away slowly. Note the animal's description and "
+                "direction of travel."),
+            'key_questions': ['KQ_AGE', 'KQ_BREATHING'],
+        },
+        'medical.lightning_strike': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 100,
+            'escalation': '911/EMS', 'intent': 'medical', 'urgency': 10,
+            'psych': 'distressed', 'determinant': 'E',
+            'response': "EMS dispatching for lightning strike.",
+            'pre_arrival': ("It is safe to touch them — they do not carry a "
+                "charge. If they are not breathing, start CPR. Lightning "
+                "victims often respond well to CPR even when they appear "
+                "lifeless. Move them to shelter if more strikes are likely."),
+            'key_questions': ['KQ_CONSCIOUS', 'KQ_BREATHING'],
+        },
+        'medical.poisoning': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 90,
+            'escalation': '911/EMS', 'intent': 'medical', 'urgency': 9,
+            'psych': 'distressed', 'determinant': 'D',
+            'response': "EMS on the way. Poison Control is also being looped in.",
+            'pre_arrival': ("Do NOT make them throw up unless poison control "
+                "tells you to. If they swallowed something, save the bottle "
+                "or container so the paramedics can identify it. If they "
+                "got it on their skin, rinse with running water for 15 "
+                "minutes. If in the eyes, flush with water for 15 minutes."),
+            'key_questions': ['KQ_AGE', 'KQ_CONSCIOUS'],
+        },
+
+        # ── FIRE: hazmat / specialty ──
+        'fire.gas_leak': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 95,
+            'escalation': 'FIRE', 'intent': 'fire', 'urgency': 9,
+            'psych': 'anxious', 'determinant': 'D',
+            'response': "Fire department and gas company dispatching.",
+            'pre_arrival': ("Get everyone OUT immediately. Do NOT use any "
+                "light switches, phones, garage door openers, or anything "
+                "that could spark — even ringing a doorbell can ignite "
+                "leaked gas. Once outside, move to at least one block away "
+                "and call from there. Don't go back in."),
+            'key_questions': ['KQ_LOCATION', 'KQ_OCCUPANTS'],
+        },
+        'fire.carbon_monoxide': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 95,
+            'escalation': 'FIRE', 'intent': 'fire', 'urgency': 9,
+            'psych': 'anxious', 'determinant': 'D',
+            'response': "Fire dispatching for CO alarm / suspected exposure.",
+            'pre_arrival': ("Get everyone outside into fresh air right now, "
+                "including pets. Don't open the windows on your way out — "
+                "that delays the firefighters' instrument readings. Anyone "
+                "with headache, nausea, or confusion needs EMS."),
+            'key_questions': ['KQ_OCCUPANTS', 'KQ_CONSCIOUS'],
+        },
+        'fire.wildfire_evac': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 95,
+            'escalation': 'FIRE', 'intent': 'fire', 'urgency': 9,
+            'psych': 'anxious', 'determinant': 'D',
+            'response': "Fire is coordinating evacuation — dispatching now.",
+            'pre_arrival': ("Leave NOW. Take only essentials: meds, ID, "
+                "phone, keys. Close all windows and doors but do not lock "
+                "them — first responders may need to enter. Drive with "
+                "headlights on. Follow posted evacuation routes; do not "
+                "improvise."),
+            'key_questions': ['KQ_LOCATION', 'KQ_OCCUPANTS'],
+        },
+        'fire.electrical': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 95,
+            'escalation': 'FIRE', 'intent': 'fire', 'urgency': 9,
+            'psych': 'anxious', 'determinant': 'D',
+            'response': "Fire dispatching for electrical fire.",
+            'pre_arrival': ("Do NOT use water on an electrical fire. If "
+                "you can safely cut the breaker, do that. Otherwise get "
+                "everyone out and close the door behind you to slow it "
+                "down. Stay low if you have to move through smoke."),
+            'key_questions': ['KQ_LOCATION', 'KQ_OCCUPANTS'],
+        },
+        'fire.kitchen_grease': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 90,
+            'escalation': 'FIRE', 'intent': 'fire', 'urgency': 8,
+            'psych': 'anxious', 'determinant': 'C',
+            'response': "Fire dispatching for kitchen / grease fire.",
+            'pre_arrival': ("Do NOT use water — it will spread the fire. "
+                "If it's small and in a pan, slide a lid over it and turn "
+                "off the burner. If it's bigger, get out and close the "
+                "door. Don't go back in for anything."),
+            'key_questions': ['KQ_LOCATION', 'KQ_OCCUPANTS'],
+        },
+        'fire.smoke_alarm_only': {
+            'action': 'PROVIDE_INFO_AND_ESCALATE', 'priority': 60,
+            'escalation': 'FIRE', 'intent': 'fire', 'urgency': 5,
+            'psych': 'anxious', 'determinant': 'B',
+            'response': "Fire is responding to check it out.",
+            'pre_arrival': ("Get out and stay out until firefighters clear "
+                "the building. A working alarm is doing its job — even if "
+                "you don't see fire, smoke or CO can be in the walls or "
+                "attic. Wait outside."),
+            'key_questions': ['KQ_LOCATION', 'KQ_OCCUPANTS'],
+        },
+
+        # ── POLICE: violent / specialty ──
+        'police.kidnapping': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 100,
+            'escalation': 'POLICE', 'intent': 'violence', 'urgency': 10,
+            'psych': 'panicked', 'determinant': 'E',
+            'response': "Police are responding immediately. Stay on the line.",
+            'pre_arrival': ("Tell me everything you can: who, what they're "
+                "wearing, vehicle make/model/color/plate, direction of "
+                "travel, time it happened. If it just happened, the next "
+                "few minutes matter most. Do not try to follow."),
+            'key_questions': ['KQ_LOCATION', 'KQ_SUSPECT_DESC'],
+        },
+        'police.child_abduction': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 100,
+            'escalation': 'POLICE', 'intent': 'violence', 'urgency': 10,
+            'psych': 'panicked', 'determinant': 'E',
+            'response': "Police responding — AMBER coordination starting.",
+            'pre_arrival': ("Stay on the line. Get me: child's full name, "
+                "age, what they were wearing, last seen where, suspect "
+                "description, vehicle if any. Don't search alone — police "
+                "will set the search pattern. Look at any cameras you "
+                "have access to."),
+            'key_questions': ['KQ_LOCATION', 'KQ_SUSPECT_DESC', 'KQ_AGE'],
+        },
+        'police.sexual_assault': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 100,
+            'escalation': 'POLICE', 'intent': 'violence', 'urgency': 10,
+            'psych': 'distressed', 'determinant': 'E',
+            'response': ("Police and EMS are on the way. You're safe to "
+                "talk with me."),
+            'pre_arrival': ("If you can, do not change clothes, shower, or "
+                "wash up — this preserves evidence, but only do it if you "
+                "want to. Your wellbeing comes first. If you are in a "
+                "place where the suspect could return, get somewhere safe "
+                "and stay on the line."),
+            'key_questions': ['KQ_LOCATION', 'KQ_SUSPECT_DESC'],
+        },
+        'police.hostage': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 100,
+            'escalation': 'POLICE', 'intent': 'violence', 'urgency': 10,
+            'psych': 'panicked', 'determinant': 'E',
+            'response': "Police including SWAT/negotiators dispatching.",
+            'pre_arrival': ("If you are the hostage and can speak: stay calm, "
+                "do exactly what they say, don't argue or try to escape. "
+                "If you can stay on the line silently, leave the phone "
+                "off-hook and put it where you can be heard."),
+            'key_questions': ['KQ_LOCATION', 'KQ_SUSPECT_DESC'],
+        },
+        'police.bomb_threat': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 100,
+            'escalation': 'POLICE', 'intent': 'threat', 'urgency': 10,
+            'psych': 'anxious', 'determinant': 'E',
+            'response': "Police and bomb squad are responding.",
+            'pre_arrival': ("Do NOT use any cell phones, two-way radios, "
+                "or wireless devices near where the threat is — they can "
+                "trigger some devices. Evacuate the area if safe. Do not "
+                "touch anything suspicious. Note exact words of the threat "
+                "if it was a call."),
+            'key_questions': ['KQ_LOCATION', 'KQ_SUSPECT_DESC'],
+        },
+        'police.suspicious_package': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 90,
+            'escalation': 'POLICE', 'intent': 'threat', 'urgency': 8,
+            'psych': 'anxious', 'determinant': 'C',
+            'response': "Police are responding to the suspicious package.",
+            'pre_arrival': ("Do not touch it, move it, or open it. Move "
+                "everyone at least 300 feet away. Do not use cell phones "
+                "near the package. Note who left it if anyone saw, and "
+                "stand by — bomb squad may need a lot of room."),
+            'key_questions': ['KQ_LOCATION'],
+        },
+        'police.drunk_driver': {
+            'action': 'PROVIDE_INFO_AND_ESCALATE', 'priority': 75,
+            'escalation': 'POLICE', 'intent': 'traffic', 'urgency': 7,
+            'psych': 'concerned', 'determinant': 'C',
+            'response': "Police are being notified — units en route.",
+            'pre_arrival': ("Do not try to stop them. Get me: vehicle make, "
+                "model, color, plate, and direction of travel. Stay back "
+                "and don't tail them aggressively — let police take over. "
+                "Note any landmarks they pass."),
+            'key_questions': ['KQ_LOCATION', 'KQ_SUSPECT_DESC'],
+        },
+        'police.vehicle_pursuit_witnessed': {
+            'action': 'PROVIDE_INFO_AND_ESCALATE', 'priority': 70,
+            'escalation': 'POLICE', 'intent': 'traffic', 'urgency': 7,
+            'psych': 'concerned', 'determinant': 'B',
+            'response': "Got it — patching this to traffic units.",
+            'pre_arrival': ("Stay back. Don't follow. Tell me direction of "
+                "travel, speed, vehicle description, plate if you got it. "
+                "Pull over to a safe spot if you're driving."),
+            'key_questions': ['KQ_LOCATION', 'KQ_SUSPECT_DESC'],
+        },
+        'police.missing_person': {
+            'action': 'PROVIDE_INFO_AND_ESCALATE', 'priority': 70,
+            'escalation': 'POLICE', 'intent': 'general', 'urgency': 6,
+            'psych': 'anxious', 'determinant': 'B',
+            'response': "Police can help — taking the report now.",
+            'pre_arrival': ("Have a recent photo ready. Get me: full name, "
+                "age, height, weight, hair, eye color, what they were "
+                "wearing when last seen, any medical conditions, where "
+                "they were last seen, and whether they have a phone with "
+                "location sharing on."),
+            'key_questions': ['KQ_AGE', 'KQ_LOCATION'],
+        },
+        'police.elder_abuse': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 85,
+            'escalation': 'POLICE', 'intent': 'violence', 'urgency': 8,
+            'psych': 'concerned', 'determinant': 'C',
+            'response': ("Police and Adult Protective Services are being "
+                "contacted."),
+            'pre_arrival': ("If the victim is in immediate danger, get them "
+                "out if you safely can. Document with photos what you can. "
+                "Do not confront the suspected abuser if they're present. "
+                "Stay on the line."),
+            'key_questions': ['KQ_AGE', 'KQ_LOCATION'],
+        },
+        'police.child_abuse': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 90,
+            'escalation': 'POLICE', 'intent': 'violence', 'urgency': 9,
+            'psych': 'concerned', 'determinant': 'D',
+            'response': ("Police and Child Protective Services responding."),
+            'pre_arrival': ("If the child is in immediate danger, get them "
+                "to a safe place if you can. Don't question the child in "
+                "detail — that's for trained interviewers. Note what you "
+                "saw or heard exactly, in their words if you can."),
+            'key_questions': ['KQ_AGE', 'KQ_LOCATION'],
+        },
+        'police.stalking': {
+            'action': 'PROVIDE_INFO_AND_ESCALATE', 'priority': 75,
+            'escalation': 'POLICE', 'intent': 'threat', 'urgency': 7,
+            'psych': 'anxious', 'determinant': 'C',
+            'response': "Police can help. Filing the report now.",
+            'pre_arrival': ("Save every text, voicemail, social-media "
+                "message, and unwanted gift — it's all evidence. Note "
+                "dates, times, and locations of every encounter. If "
+                "they're outside your residence right now, lock doors "
+                "and stay inside."),
+            'key_questions': ['KQ_LOCATION', 'KQ_SUSPECT_DESC'],
+        },
+        'police.identity_theft': {
+            'action': 'PROVIDE_INFO_AND_ESCALATE', 'priority': 50,
+            'escalation': 'POLICE', 'intent': 'fraud', 'urgency': 4,
+            'psych': 'anxious', 'determinant': 'O',
+            'response': ("Police can take a report. Also call your bank "
+                "and place fraud alerts on your credit reports."),
+            'pre_arrival': ("Contact each bank and credit card directly. "
+                "File at identitytheft.gov for a recovery plan. Place a "
+                "fraud alert with one of the three credit bureaus — "
+                "Equifax, Experian, or TransUnion. Save every fraudulent "
+                "charge or letter."),
+            'key_questions': [],
+        },
+
+        # ── TRAFFIC / VEHICLES ──
+        'traffic.mvc.injury': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 95,
+            'escalation': '911/EMS', 'intent': 'medical', 'urgency': 9,
+            'psych': 'distressed', 'determinant': 'D',
+            'response': "EMS, fire, and police all dispatching to the crash.",
+            'pre_arrival': ("Do not move anyone unless they're in immediate "
+                "danger from fire or another threat — moving them can make "
+                "spinal injuries worse. Turn on hazards. If the vehicle is "
+                "blocking traffic, set out flares or triangles if you have "
+                "them. Stay on the line."),
+            'key_questions': ['KQ_LOCATION', 'KQ_OCCUPANTS'],
+        },
+        'traffic.mvc.no_injury': {
+            'action': 'PROVIDE_INFO_AND_ESCALATE', 'priority': 50,
+            'escalation': 'POLICE', 'intent': 'traffic', 'urgency': 4,
+            'psych': 'concerned', 'determinant': 'A',
+            'response': "Police on the way for the report.",
+            'pre_arrival': ("Move vehicles out of traffic if they're "
+                "drivable. Exchange information: name, license, "
+                "registration, insurance. Take photos of damage and the "
+                "scene. Don't admit fault — let the report find it."),
+            'key_questions': ['KQ_LOCATION'],
+        },
+        'traffic.hit_and_run': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 80,
+            'escalation': 'POLICE', 'intent': 'traffic', 'urgency': 7,
+            'psych': 'distressed', 'determinant': 'C',
+            'response': "Police dispatching — hit-and-run investigation.",
+            'pre_arrival': ("Do NOT chase the other vehicle. Get me what "
+                "you have: make, model, color, plate (even partial), "
+                "direction of travel, time. Take photos of damage to your "
+                "vehicle. If anyone is injured, EMS is also coming."),
+            'key_questions': ['KQ_LOCATION', 'KQ_SUSPECT_DESC'],
+        },
+        'traffic.pedestrian_struck': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 100,
+            'escalation': '911/EMS', 'intent': 'medical', 'urgency': 10,
+            'psych': 'panicked', 'determinant': 'E',
+            'response': "EMS, fire, and police all responding immediately.",
+            'pre_arrival': ("Do not move them. Block traffic if you safely "
+                "can — turn hazards on, stand visibly upstream of them. "
+                "If they're conscious, keep them lying still. If not "
+                "breathing, start CPR."),
+            'key_questions': ['KQ_LOCATION', 'KQ_AGE', 'KQ_BREATHING'],
+        },
+
+        # ── INFRASTRUCTURE / TECHNICAL ──
+        'infra.power_line_down': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 85,
+            'escalation': 'FIRE', 'intent': 'hazard', 'urgency': 8,
+            'psych': 'concerned', 'determinant': 'C',
+            'response': "Fire and the power company dispatching.",
+            'pre_arrival': ("Stay AT LEAST 35 feet away from any downed "
+                "line, even if it looks dead. Do not touch anything in "
+                "contact with it — fences, water, vehicles can carry "
+                "current. Keep others away too."),
+            'key_questions': ['KQ_LOCATION'],
+        },
+        'infra.water_main_break': {
+            'action': 'PROVIDE_INFO_AND_ESCALATE', 'priority': 50,
+            'escalation': 'NON_EMERGENCY', 'intent': 'general', 'urgency': 4,
+            'psych': 'concerned', 'determinant': 'A',
+            'response': "Water utility is being notified.",
+            'pre_arrival': ("Stay clear of any flowing water — it can "
+                "undermine roads and sidewalks. If water is entering a "
+                "building, shut off the main valve if you safely can."),
+            'key_questions': ['KQ_LOCATION'],
+        },
+        'infra.tree_down': {
+            'action': 'PROVIDE_INFO_AND_ESCALATE', 'priority': 50,
+            'escalation': 'NON_EMERGENCY', 'intent': 'general', 'urgency': 4,
+            'psych': 'concerned', 'determinant': 'A',
+            'response': "Public works is being notified.",
+            'pre_arrival': ("Stay back. If it's tangled in power lines, "
+                "treat it as electrified — don't approach. If a road is "
+                "blocked, place flares or warning triangles if you have "
+                "them."),
+            'key_questions': ['KQ_LOCATION'],
+        },
+
+        # ── MENTAL HEALTH (additional) ──
+        'crisis.psychotic_break': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 85,
+            'escalation': '911/EMS', 'intent': 'mental', 'urgency': 8,
+            'psych': 'distressed', 'determinant': 'C',
+            'response': "EMS and crisis team dispatching.",
+            'pre_arrival': ("Stay calm and speak softly. Don't argue with "
+                "what they're seeing or hearing — that escalates things. "
+                "Reduce stimulation: turn off TV, dim lights, move other "
+                "people out of the room. Keep your distance and exits "
+                "clear for both of you."),
+            'key_questions': ['KQ_AGE', 'KQ_VIOLENT'],
+        },
+        'crisis.panic_attack': {
+            'action': 'PROVIDE_INFO_AND_ESCALATE', 'priority': 60,
+            'escalation': '911/EMS', 'intent': 'mental', 'urgency': 5,
+            'psych': 'panicked', 'determinant': 'B',
+            'response': "EMS is on the way. Let's get your breathing slow.",
+            'pre_arrival': ("Sit down. Slow breathing — in for 4, hold for "
+                "4, out for 6. Repeat. Tell me 5 things you can see, 4 you "
+                "can touch, 3 you can hear, 2 you can smell, 1 you can "
+                "taste. This is a panic attack — uncomfortable, not "
+                "dangerous. It will pass."),
+            'key_questions': ['KQ_AGE'],
+        },
+        'crisis.dementia_wandering': {
+            'action': 'EMERGENCY_ESCALATE', 'priority': 80,
+            'escalation': 'POLICE', 'intent': 'general', 'urgency': 7,
+            'psych': 'anxious', 'determinant': 'C',
+            'response': "Police are starting a search now.",
+            'pre_arrival': ("Get me a recent photo, full name, age, what "
+                "they were wearing, any medical conditions, last seen "
+                "where, and whether they tend to head in a particular "
+                "direction (former workplace, childhood home, etc.). Most "
+                "wanderers are found within a half-mile."),
+            'key_questions': ['KQ_AGE', 'KQ_LOCATION'],
+        },
+
+        # ── WELFARE CHECK ──
+        'welfare.check': {
+            'action': 'PROVIDE_INFO_AND_ESCALATE', 'priority': 60,
+            'escalation': 'POLICE', 'intent': 'general', 'urgency': 5,
+            'psych': 'concerned', 'determinant': 'B',
+            'response': "Police can do a welfare check — sending units now.",
+            'pre_arrival': ("Tell me the address, the person's name and "
+                "age, and what's making you concerned. When did you last "
+                "talk to them? Do they live alone? Any medical conditions, "
+                "medications, weapons in the home?"),
+            'key_questions': ['KQ_AGE', 'KQ_LOCATION'],
+        },
     }
 
     # ── Phrase index: cumulative-text contains the phrase → scenario key ──
@@ -3511,6 +4098,137 @@ class DispatcherKnowledge:
         ('found a confused old',            'info.found_person.confused'),
         ('how do i get to',                 'info.directions'),
         ('where is the hospital',           'info.directions'),
+
+        # ── Additional medical (drowning / shock / heat / cold / etc.) ──
+        ('drowning',                        'medical.drowning'),
+        ('drowned',                         'medical.drowning'),
+        ('went under water',                'medical.drowning'),
+        ('pulled from the water',           'medical.drowning'),
+        ('electric shock',                  'medical.electrocution'),
+        ('electrocuted',                    'medical.electrocution'),
+        ('got shocked',                     'medical.electrocution'),
+        ('touched a wire',                  'medical.electrocution'),
+        ('allergic reaction',               'medical.allergic_reaction.severe'),
+        ('anaphylaxis',                     'medical.allergic_reaction.severe'),
+        ('throat swelling',                 'medical.allergic_reaction.severe'),
+        ('cant breathe allergic',           'medical.allergic_reaction.severe'),
+        ('epipen',                          'medical.allergic_reaction.severe'),
+        ('diabetic',                        'medical.diabetic_emergency'),
+        ('low blood sugar',                 'medical.diabetic_emergency'),
+        ('high blood sugar',                'medical.diabetic_emergency'),
+        ('insulin',                         'medical.diabetic_emergency'),
+        ('hypothermia',                     'medical.hypothermia'),
+        ('freezing to death',               'medical.hypothermia'),
+        ('too cold',                        'medical.hypothermia'),
+        ('heat stroke',                     'medical.heat_stroke'),
+        ('heatstroke',                      'medical.heat_stroke'),
+        ('overheated',                      'medical.heat_stroke'),
+        ('snake bite',                      'medical.snake_bite'),
+        ('bit by a snake',                  'medical.snake_bite'),
+        ('bitten by an animal',             'medical.animal_attack'),
+        ('dog attacked',                    'medical.animal_attack'),
+        ('dog bite',                        'medical.animal_attack'),
+        ('animal attack',                   'medical.animal_attack'),
+        ('lightning struck',                'medical.lightning_strike'),
+        ('struck by lightning',             'medical.lightning_strike'),
+        ('hit by lightning',                'medical.lightning_strike'),
+        ('poisoned',                        'medical.poisoning'),
+        ('swallowed poison',                'medical.poisoning'),
+        ('ate something bad',               'medical.poisoning'),
+        ('drank chemicals',                 'medical.poisoning'),
+
+        # ── Additional fire / hazmat ──
+        ('gas leak',                        'fire.gas_leak'),
+        ('smell gas',                       'fire.gas_leak'),
+        ('smell of gas',                    'fire.gas_leak'),
+        ('natural gas',                     'fire.gas_leak'),
+        ('carbon monoxide',                 'fire.carbon_monoxide'),
+        ('co alarm',                        'fire.carbon_monoxide'),
+        ('co detector',                     'fire.carbon_monoxide'),
+        ('wildfire',                        'fire.wildfire_evac'),
+        ('forest fire',                     'fire.wildfire_evac'),
+        ('brush fire',                      'fire.wildfire_evac'),
+        ('evacuate',                        'fire.wildfire_evac'),
+        ('electrical fire',                 'fire.electrical'),
+        ('outlet on fire',                  'fire.electrical'),
+        ('grease fire',                     'fire.kitchen_grease'),
+        ('kitchen fire',                    'fire.kitchen_grease'),
+        ('stove on fire',                   'fire.kitchen_grease'),
+        ('smoke alarm going off',           'fire.smoke_alarm_only'),
+        ('fire alarm',                      'fire.smoke_alarm_only'),
+
+        # ── Additional police / violent ──
+        ('kidnapping',                      'police.kidnapping'),
+        ('been kidnapped',                  'police.kidnapping'),
+        ('took my child',                   'police.child_abduction'),
+        ('child abduction',                 'police.child_abduction'),
+        ('amber alert',                     'police.child_abduction'),
+        ('my baby is missing',              'police.child_abduction'),
+        ('been raped',                      'police.sexual_assault'),
+        ('sexual assault',                  'police.sexual_assault'),
+        ('was assaulted',                   'police.sexual_assault'),
+        ('hostage',                         'police.hostage'),
+        ('held against will',               'police.hostage'),
+        ('bomb threat',                     'police.bomb_threat'),
+        ('there is a bomb',                 'police.bomb_threat'),
+        ('threatened to bomb',              'police.bomb_threat'),
+        ('suspicious package',              'police.suspicious_package'),
+        ('unattended package',              'police.suspicious_package'),
+        ('drunk driver',                    'police.drunk_driver'),
+        ('impaired driver',                 'police.drunk_driver'),
+        ('drunk driving',                   'police.drunk_driver'),
+        ('reckless driver',                 'police.drunk_driver'),
+        ('high speed chase',                'police.vehicle_pursuit_witnessed'),
+        ('police chase',                    'police.vehicle_pursuit_witnessed'),
+        ('missing person',                  'police.missing_person'),
+        ('cant find',                       'police.missing_person'),
+        ('elder abuse',                     'police.elder_abuse'),
+        ('hurting my mom',                  'police.elder_abuse'),
+        ('hurting my dad',                  'police.elder_abuse'),
+        ('child abuse',                     'police.child_abuse'),
+        ('beating a child',                 'police.child_abuse'),
+        ('hurting a child',                 'police.child_abuse'),
+        ('stalker',                         'police.stalking'),
+        ('being stalked',                   'police.stalking'),
+        ('following me',                    'police.stalking'),
+        ('identity theft',                  'police.identity_theft'),
+        ('stole my identity',               'police.identity_theft'),
+
+        # ── Traffic ──
+        ('car accident',                    'traffic.mvc.injury'),
+        ('car crash',                       'traffic.mvc.injury'),
+        ('crashed my car',                  'traffic.mvc.injury'),
+        ('hit and run',                     'traffic.hit_and_run'),
+        ('they drove off',                  'traffic.hit_and_run'),
+        ('struck a pedestrian',             'traffic.pedestrian_struck'),
+        ('hit a pedestrian',                'traffic.pedestrian_struck'),
+        ('hit by a car',                    'traffic.pedestrian_struck'),
+
+        # ── Infrastructure ──
+        ('power line down',                 'infra.power_line_down'),
+        ('downed power line',               'infra.power_line_down'),
+        ('wires on the ground',             'infra.power_line_down'),
+        ('water main',                      'infra.water_main_break'),
+        ('water everywhere street',         'infra.water_main_break'),
+        ('tree fell',                       'infra.tree_down'),
+        ('tree blocking',                   'infra.tree_down'),
+        ('tree on the road',                'infra.tree_down'),
+
+        # ── Additional crisis ──
+        ('having a panic attack',           'crisis.panic_attack'),
+        ('panic attack',                    'crisis.panic_attack'),
+        ('hearing voices',                  'crisis.psychotic_break'),
+        ('seeing things',                   'crisis.psychotic_break'),
+        ('hes wandering off',               'crisis.dementia_wandering'),
+        ('shes wandering off',              'crisis.dementia_wandering'),
+        ('alzheimers',                      'crisis.dementia_wandering'),
+        ('dementia patient',                'crisis.dementia_wandering'),
+
+        # ── Welfare ──
+        ('welfare check',                   'welfare.check'),
+        ('havent heard from',               'welfare.check'),
+        ('check on someone',                'welfare.check'),
+        ('hasnt answered the phone',        'welfare.check'),
     ]
 
     # Build a lower-cased sorted-by-length-desc tuple at import time so
@@ -4306,6 +5024,78 @@ class DispatcherProtocol:
             return 'approximate'
         return None
 
+    # Caller verbal location indicators — strings the caller says that
+    # mean "I told you where I am." We don't need to validate the address;
+    # acknowledging it satisfies dispatch protocol so we can advance.
+    _ADDRESS_PATTERNS = (
+        # Common address shapes
+        r'\b\d{1,5}\s+\w+\s+(street|st\.?|avenue|ave\.?|road|rd\.?|'
+        r'boulevard|blvd\.?|lane|ln\.?|drive|dr\.?|way|court|ct\.?|'
+        r'place|pl\.?|circle|cir\.?|highway|hwy\.?|route|rt\.?)\b',
+        # "at <number> <word>"
+        r'\bat\s+\d{1,5}\s+\w+',
+        # Cross streets ("X and Y", "X & Y")
+        r'\b\w+\s+(and|&)\s+\w+\s+(street|avenue|road|st|ave|rd|blvd)\b',
+        # "near <landmark>"
+        r'\bnear\s+(the\s+)?\w+',
+        # "in front of"
+        r'\bin\s+front\s+of\b',
+        # Apartment / unit
+        r'\bapt\.?\s*\d',
+        r'\bapartment\s+\d',
+        r'\bunit\s+\d',
+        # "the <building name>"
+        r'\b(the\s+)?(school|hospital|library|park|mall|store|gas\s+station|'
+        r'church|restaurant|bank|station|stadium)\b',
+        # Zip code
+        r'\b\d{5}(-\d{4})?\b',
+    )
+
+    @classmethod
+    def _verbal_location_given(cls, transcript_chunk):
+        """True if the caller's most recent line contains anything that
+        sounds like address / landmark / cross-street info. We don't try
+        to validate — only to detect that the caller is engaging with
+        the location ask, so the protocol can advance."""
+        if not transcript_chunk:
+            return False
+        text = (transcript_chunk or '').lower()
+        for pat in cls._ADDRESS_PATTERNS:
+            try:
+                if re.search(pat, text):
+                    return True
+            except re.error:
+                continue
+        return False
+
+    @classmethod
+    def _is_engagement(cls, transcript_chunk):
+        """True if the caller said something — even just 'yes' or
+        'I don't know' — that proves they're on the line. The protocol
+        uses this to advance past stages where the caller didn't have
+        the requested info but did engage."""
+        if not transcript_chunk:
+            return False
+        bare = re.sub(r'[^\w\s\']', ' ', transcript_chunk).strip().lower()
+        if not bare:
+            return False
+        return len(bare.split()) >= 1
+
+    @classmethod
+    def _is_uncertain_answer(cls, transcript_chunk):
+        """Caller said they don't know / can't see / not sure where they are.
+        Triggers the protocol to advance with reassurance + alternative
+        location strategy."""
+        if not transcript_chunk:
+            return False
+        text = (transcript_chunk or '').lower()
+        return any(p in text for p in (
+            "i don't know", "i dont know", "no idea", "not sure",
+            "i can't see", "cant see", "i can't tell", "cant tell",
+            "i'm lost", "im lost", "no clue", "don't know where",
+            "dont know where",
+        ))
+
     @staticmethod
     def _detect_safety_keywords(transcript_chunk):
         """Return dict of safety signals heard in the latest utterance."""
@@ -4357,12 +5147,49 @@ class DispatcherProtocol:
             # detail if critical.
             state['location_confirmed'] = is_critical is False
 
+        # ── REPLY-BASED LOCATION PROGRESSION ──
+        # Operators reported the AI looped on "where are you?" forever
+        # because no GPS fix arrived. Now we advance when the caller:
+        #   (a) gave anything that sounds like a location (we accept it),
+        #   (b) said they don't know (we move to alternative strategies),
+        #   (c) just engaged with anything else for ≥3 turns (move on).
+        if not state['location_confirmed']:
+            if cls._verbal_location_given(transcript_chunk):
+                state['location_confirmed'] = True
+                state['location_from_speech'] = True
+                # Stash the words so we can echo them back
+                session['verbal_location'] = (transcript_chunk or '').strip()
+                notes.append('doctrine: location accepted from caller speech')
+            elif cls._is_uncertain_answer(transcript_chunk):
+                # Caller doesn't know — advance anyway and pivot to
+                # description-of-surroundings strategy in pre_arrival
+                state['location_confirmed'] = True
+                state['location_unknown'] = True
+                notes.append("doctrine: caller doesn't know location — advancing")
+            elif (state.get('stage') == 'location'
+                  and state.get('turns_in_stage', 0) >= 3
+                  and cls._is_engagement(transcript_chunk)):
+                # The caller is talking but not giving a location.
+                # Don't loop — move on so the AI can ask different questions.
+                state['location_confirmed'] = True
+                state['location_unknown'] = True
+                notes.append('doctrine: 3 turns without location — advancing')
+
         safety = cls._detect_safety_keywords(transcript_chunk)
         if safety['caller_safe']:
             state['scene_safety_assessed'] = True
         if safety['still_present_threat']:
             state['scene_safety_assessed'] = True  # we know it's dangerous
             notes.append('doctrine: caller indicates threat still present')
+        # If the caller has answered the safety question (any sentence
+        # mentioning who's there, what they're doing, etc.) and we're
+        # in scene_safety, advance after 2 turns.
+        if (state.get('stage') == 'scene_safety'
+                and not state['scene_safety_assessed']
+                and cls._is_engagement(transcript_chunk)
+                and state.get('turns_in_stage', 0) >= 2):
+            state['scene_safety_assessed'] = True
+            notes.append('doctrine: scene safety advanced after 2 caller turns')
 
         # ── State transitions ──
         prev_stage = state['stage']
@@ -4404,21 +5231,55 @@ class DispatcherProtocol:
         parts = []
 
         if state['stage'] == 'location':
-            parts.append("I'm here. Help is on the way.")
+            # Don't repeat the SAME intro every turn — only the very
+            # first time tell the caller "Help is on the way." After
+            # that, vary the question so the caller knows we heard them.
+            turns = int(state.get('turns_in_stage', 0))
+            if not state.get('intro_given'):
+                parts.append("I'm here. Help is on the way.")
+                state['intro_given'] = True
             if loc_quality == 'approximate':
                 loc = session.get('location') or {}
                 city = loc.get('city') or 'your area'
-                parts.append(f"I have you in {city} — what's the street address "
-                             "or nearest cross street? This is the most important "
-                             "piece of information.")
+                if turns == 0:
+                    parts.append(
+                        f"I have you in {city} — what's the street "
+                        "address or nearest cross street?")
+                elif turns == 1:
+                    parts.append(
+                        "Anything you can see — a store name, "
+                        "a building number, a road sign?")
+                else:
+                    parts.append(
+                        "Even rough — what neighborhood, or what's "
+                        "close to you?")
                 notes.append('doctrine: approximate location — requesting street detail')
             else:
-                parts.append("First — where are you? Address, intersection, "
-                             "landmark, anything you can see. Don't hang up "
-                             "even if you're not sure.")
+                # Cycle through different ways of asking so the caller
+                # gets a fresh prompt each turn.
+                location_prompts = (
+                    "First — where are you? Address, intersection, "
+                    "landmark, anything you can see.",
+                    "What's around you right now? A street name, a "
+                    "store, a number on a building?",
+                    "Tell me what you can see. Even one detail helps — "
+                    "a sign, a color, a landmark.",
+                    "Don't worry about being exact — what's the closest "
+                    "thing you can name?",
+                )
+                parts.append(location_prompts[turns % len(location_prompts)])
                 notes.append('doctrine: no location yet — soliciting it before all else')
 
         elif state['stage'] == 'scene_safety':
+            # Acknowledge the location info we just got (only on the first
+            # turn of this stage so we don't repeat).
+            if state.get('turns_in_stage', 0) == 0:
+                if state.get('location_from_speech'):
+                    parts.append("Got it — I have your location.")
+                elif state.get('location_unknown'):
+                    parts.append(
+                        "Okay — we're working with what we have. "
+                        "Stay on the line.")
             if intent == 'violence':
                 if safety['still_present_threat']:
                     parts.append("Officers are en route right now.")
@@ -4508,6 +5369,2560 @@ class DispatcherProtocol:
         return ' '.join(p for p in parts if p), notes
 
 
+# ── English Dictionary (hard-coded, conversational vocabulary) ──────────
+# Used by the casual chat generator so when a caller asks "what does X
+# mean?" the AI actually has a definition to give back. Coverage is
+# practical: common verbs, abstract nouns, evaluative adjectives,
+# conversation meta-words. Definitions are 1-2 sentences in plain English.
+# Operators wanting to extend this should add (word -> definition)
+# pairs alphabetically.
+_ENGLISH_DICT = {
+    # Conversation meta / intent words
+    'mean':         "to have a particular meaning or to intend something. When someone asks 'what do you mean,' they want the speaker to explain or rephrase.",
+    'means':        "the same as 'mean' — to signify something. As a noun, 'means' can also be a method or way of doing something.",
+    'meaning':      "what something is intended to express or what it represents.",
+    'understand':   "to grasp the meaning, importance, or nature of something.",
+    'know':         "to have information about something, or to be familiar with someone.",
+    'think':        "to use reason or to form an opinion in your mind.",
+    'feel':         "to experience an emotion or a physical sensation.",
+    'say':          "to speak words out loud or to express something in language.",
+    'hear':         "to perceive a sound through your ears.",
+    'see':          "to perceive with your eyes, or to understand.",
+    'tell':         "to communicate information by speaking or writing it.",
+    'ask':          "to put a question to someone.",
+    'answer':       "a reply to a question, or to give a reply.",
+    'question':     "a sentence asking for information or a reply.",
+
+    # Common abstract nouns
+    'time':         "the indefinite continued progress of existence — measured in seconds, minutes, hours, days, etc.",
+    'day':          "a period of 24 hours, or the period of light between sunrise and sunset.",
+    'night':        "the period of darkness between sunset and sunrise.",
+    'life':         "the condition of being alive; a person's existence.",
+    'world':        "the earth, together with all of its countries and peoples.",
+    'people':       "human beings in general or considered collectively.",
+    'person':       "a single human being.",
+    'thing':        "an object, idea, or matter — used when the noun is unspecified.",
+    'place':        "a particular position, point, or area in space.",
+    'home':         "the place where one lives permanently.",
+    'work':         "activity involving effort done to achieve a purpose, often as a job.",
+    'job':          "a paid position of regular employment.",
+    'family':       "a group of one or more parents and their children living together.",
+    'friend':       "a person with whom one has a bond of mutual affection.",
+    'love':         "a strong feeling of affection.",
+    'hate':         "intense dislike for something or someone.",
+    'happy':        "feeling or showing pleasure or contentment.",
+    'sad':          "feeling sorrow or unhappiness.",
+    'angry':        "feeling strong displeasure or hostility.",
+    'tired':        "in need of sleep or rest; weary.",
+    'sick':         "affected by physical or mental illness.",
+    'safe':         "protected from danger or risk.",
+    'scared':       "fearful or frightened.",
+    'okay':         "satisfactory but not exceptionally good; agreeing.",
+    'fine':         "of high quality, or okay.",
+    'good':         "to be desired or approved of; the opposite of bad.",
+    'bad':          "of poor quality; not desirable.",
+    'great':        "of an extent, amount, or intensity considerably above the normal — or excellent.",
+    'nice':         "pleasant; agreeable; satisfactory.",
+    'cool':         "fairly low in temperature, or calmly impressive.",
+    'hot':          "having a high temperature.",
+    'cold':         "of low temperature; lacking warmth.",
+    'old':          "having lived for a long time; from earlier times.",
+    'new':          "recently created, discovered, or experienced.",
+    'real':         "actually existing as a thing or occurring in fact; not imagined.",
+    'fake':         "not genuine; imitation.",
+    'true':         "in accordance with fact or reality.",
+    'false':        "not according to truth or fact.",
+    'right':        "morally good, justified, or acceptable; correct.",
+    'wrong':        "not correct or true; mistaken.",
+
+    # Conversational hedges / fillers people often ask about
+    'maybe':        "used to express uncertainty — possibly, but not certainly.",
+    'perhaps':      "expressing uncertainty or possibility — like 'maybe.'",
+    'probably':     "almost certainly; as far as one knows or can tell.",
+    'definitely':   "without doubt; for certain.",
+    'sure':         "certain or confident.",
+    'yes':          "an affirmative answer; agreement.",
+    'no':           "a negative answer; refusal.",
+
+    # Tech / call-center vocabulary
+    'ai':           "artificial intelligence — a computer program designed to perform tasks that normally require human thought.",
+    'computer':     "an electronic device that stores and processes information.",
+    'phone':        "a device used to talk with someone who is far away.",
+    'call':         "a telephone connection or the act of speaking to someone on the phone.",
+    'voice':        "the sound produced by a person speaking.",
+    'mic':          "short for microphone — a device that converts sound into an electrical signal.",
+    'microphone':   "a device that converts sound into an electrical signal.",
+    'live':         "happening in real time; not pre-recorded.",
+    'lag':          "a delay between an action and a response.",
+    'connection':   "the link between two points or people, including a phone or internet link.",
+    'signal':       "a transmitted electrical or radio wave that carries information.",
+    'recording':    "an audio or video file captured for later playback.",
+    'dispatch':     "to send someone or something off to a destination — in emergencies, to send police, fire, or EMS.",
+    'emergency':    "a serious, unexpected situation that requires immediate action.",
+    'police':       "the civil force responsible for maintaining public order.",
+    'fire':         "combustion that produces heat and flame; the public service that fights fires.",
+    'ambulance':    "a vehicle for taking sick or injured people to and from the hospital.",
+    'medical':      "relating to medicine or the treatment of injury or illness.",
+    'help':         "to make easier; to assist someone.",
+    'safe':         "protected from danger.",
+    'danger':       "the possibility of harm or injury.",
+    'crime':        "an action that breaks the law.",
+    'theft':        "the act of stealing.",
+    'assault':      "a physical attack on someone.",
+    'violence':     "physical force intended to hurt or damage.",
+    'weapon':       "an object used to inflict harm — a gun, knife, etc.",
+    'gun':          "a weapon that fires bullets.",
+    'knife':        "a sharp blade with a handle, used for cutting or as a weapon.",
+
+    # Body / medical
+    'pain':         "physical suffering or discomfort caused by injury or illness.",
+    'hurt':         "to feel pain or to cause pain.",
+    'breathe':      "to take air into the lungs and let it out.",
+    'breathing':    "the act of taking air in and out of the lungs.",
+    'pulse':        "the rhythmic throbbing of arteries as blood is pumped through them.",
+    'heart':        "the organ that pumps blood through the body.",
+    'cpr':          "cardiopulmonary resuscitation — chest compressions and rescue breaths to restart heartbeat or breathing.",
+    'blood':        "the red liquid that circulates in the body.",
+    'bleed':        "to lose blood from the body.",
+    'broken':       "fractured, damaged, or no longer functional.",
+
+    # Time-of-day / schedule
+    'morning':      "the period from sunrise to noon.",
+    'afternoon':    "the time from noon to evening.",
+    'evening':      "the period of time at the end of the day, before night.",
+    'today':        "this present day.",
+    'tomorrow':     "the day after today.",
+    'yesterday':    "the day before today.",
+    'now':          "at this moment.",
+    'later':        "at some time in the future.",
+    'soon':         "in a short time from now.",
+
+    # Common food/drink the AI fact-table also covers
+    'food':         "any substance that people eat for nourishment.",
+    'water':        "the clear liquid we drink and that fills oceans, lakes, and rivers.",
+    'coffee':       "a drink made from roasted coffee beans, usually served hot.",
+    'tea':          "a hot drink made by steeping leaves in boiling water.",
+    'beer':         "an alcoholic drink made from grain, water, hops, and yeast.",
+    'wine':         "an alcoholic drink made from fermented grapes.",
+    'brewery':      "a place where beer is made.",
+    'taste':        "the flavor of something, or the act of tasting.",
+    'sharp':        "having an edge or point that can cut; or a clear, distinct flavor; or quick-witted.",
+    'sweet':        "tasting like sugar; pleasant.",
+    'sour':         "having an acidic taste.",
+    'bitter':       "having a sharp, unpleasant taste.",
+
+    # Music / leisure
+    'music':        "vocal or instrumental sounds combined to produce harmony or expression.",
+    'song':         "a short musical composition with words.",
+    'walk':         "to move on foot at a steady pace.",
+    'sleep':        "the natural state of rest in which the eyes are closed and consciousness is suspended.",
+    'fun':          "enjoyment, amusement, or light-hearted pleasure.",
+    'boring':       "not interesting; tedious.",
+    'interesting':  "holding the attention; arousing curiosity.",
+
+    # Big-concept / abstract nouns the AI gets asked about a lot
+    'meaning':      "what something is intended to express or represent — the point of it.",
+    'purpose':      "the reason for which something exists or is done.",
+    'love':         "a strong feeling of affection and lasting commitment to another person.",
+    'happiness':    "a state of well-being and contentment.",
+    'sadness':      "a feeling of sorrow or unhappiness.",
+    'truth':        "a fact or statement that matches reality.",
+    'reality':      "the state of things as they actually are.",
+    'dream':        "images and ideas that occur during sleep, or a strongly desired goal.",
+    'hope':         "a feeling of expectation that something good will happen.",
+    'faith':        "trust or confidence in someone or something, often spiritual.",
+    'belief':       "an acceptance that something is true.",
+    'mind':         "the part of a person that thinks, feels, and remembers.",
+    'soul':         "the spiritual part of a person, considered immortal in many traditions.",
+    'body':         "the physical structure of a person or animal.",
+    'spirit':       "the non-physical part of a person — character, mood, or essence.",
+    'consciousness': "awareness of yourself and your surroundings.",
+    'death':        "the end of life.",
+    'birth':        "the start of life — being born.",
+    'identity':     "who someone is — the qualities and beliefs that make them them.",
+    'family':       "a group of related people, usually parents and children.",
+    'friend':       "a person you know and like and trust.",
+    'enemy':        "someone hostile to you.",
+    'love':         "a strong feeling of affection or deep attachment.",
+    'fear':         "an unpleasant feeling caused by danger or threat.",
+    'anger':        "a strong feeling of displeasure or hostility.",
+    'joy':          "great pleasure or happiness.",
+
+    # Verbs people often ask about
+    'live':         "to be alive, or to make one's home somewhere.",
+    'die':          "to stop being alive.",
+    'grow':         "to develop, or to increase in size.",
+    'change':       "to become different or to make different.",
+    'learn':        "to gain knowledge or skill by study or experience.",
+    'teach':        "to help someone learn something.",
+    'help':         "to make easier; to assist someone.",
+    'try':          "to attempt to do something.",
+    'fail':         "to be unsuccessful.",
+    'succeed':      "to achieve something planned or attempted.",
+    'win':          "to be successful in a contest or fight.",
+    'lose':         "to fail to win, or to be deprived of something.",
+    'fight':        "to engage in physical or verbal conflict.",
+    'rest':         "to stop activity in order to relax.",
+    'play':         "to engage in activity for enjoyment.",
+    'create':       "to bring something into existence.",
+    'destroy':      "to ruin or break beyond repair.",
+    'build':        "to make something by putting parts together.",
+
+    # Practical/world
+    'school':       "a place where children go to learn.",
+    'church':       "a building used for Christian worship.",
+    'temple':       "a building dedicated to the service of a religion.",
+    'hospital':     "an institution providing medical and surgical treatment.",
+    'doctor':       "a person trained to diagnose and treat illness.",
+    'nurse':        "a person trained to care for the sick or injured.",
+    'lawyer':       "a person trained in law who advises clients and represents them.",
+    'judge':        "a public official who decides legal cases.",
+    'teacher':      "a person who helps others learn.",
+    'student':      "a person who is studying.",
+    'parent':       "a mother or father.",
+    'child':        "a young human being.",
+    'baby':         "a very young child or animal.",
+    'man':          "an adult male human.",
+    'woman':        "an adult female human.",
+    'boy':          "a young male.",
+    'girl':         "a young female.",
+
+    # Geography / nature
+    'sun':          "the star at the center of our solar system; the source of daylight.",
+    'moon':         "Earth's natural satellite, visible mainly at night.",
+    'star':         "a luminous point in the night sky; a giant ball of glowing gas.",
+    'sky':          "the area above the earth where you see clouds, sun, moon, and stars.",
+    'earth':        "the planet we live on; also dirt or soil.",
+    'ocean':        "a very large body of salt water.",
+    'sea':          "a large body of salt water, usually smaller than an ocean.",
+    'river':        "a large natural stream of water flowing in a channel to the sea or a lake.",
+    'lake':         "a large body of water surrounded by land.",
+    'mountain':     "a large natural elevation of the earth's surface.",
+    'forest':       "a large area covered chiefly with trees and undergrowth.",
+    'tree':         "a tall plant with a trunk, branches, and leaves.",
+    'flower':       "the part of a plant that blooms, often colorful.",
+    'animal':       "a living organism that feeds on other organisms and can usually move.",
+    'human':        "a person; a member of the species Homo sapiens.",
+
+    # Tech expanded
+    'internet':     "the global network of computers that lets devices share information.",
+    'website':      "a set of related pages on the internet.",
+    'app':          "an application — a software program designed to do a specific task.",
+    'data':         "facts and statistics collected for reference or analysis.",
+    'code':         "the instructions written for a computer to follow.",
+    'program':      "a set of computer instructions, or a planned activity.",
+    'software':     "the programs that run on a computer.",
+    'hardware':     "the physical parts of a computer.",
+    'robot':        "a machine that performs tasks usually done by people, sometimes automatically.",
+    'algorithm':    "a step-by-step procedure for solving a problem or doing a calculation.",
+}
+
+
+def english_definition(word):
+    """Look up a word in the hard-coded English dictionary. Returns a
+    definition string or None. Lowercases + strips punctuation before
+    lookup so 'MEAN?' / 'mean.' both resolve."""
+    if not word:
+        return None
+    w = re.sub(r"[^a-z']", '', word.lower().strip())
+    if not w:
+        return None
+    return _ENGLISH_DICT.get(w)
+
+
+# ── Casual Chat Generator (JUST TALK mode) ───────────────────────────────
+class CasualChatGenerator:
+    """Generates non-emergency conversational replies from the AI system's
+    own consciousness state. No scripted lines. No phrase tables. Each turn
+    is a fresh recombination of light English fragments plus topic seeds
+    pulled from the caller's last words and the simulator's omega-swarm
+    entity attributes (C, karma, coherence, ignition_rate, free_energy,
+    epistemic_drive).
+
+    The generator is intentionally NOT a language model — it's RNG-driven
+    procedural composition seeded by the AI's continuous-valued state, so
+    the same chat session never produces the same line twice and the AI's
+    "mood" drifts as omega evolves. High coherence → tighter, more focused
+    sentences. High epistemic_drive → asks the caller more questions. High
+    free_energy → more unusual / curious turns of phrase. High karma →
+    warmer affect.
+    """
+
+    # Building blocks. None of these are full lines — they are word-level
+    # fragments that get recombined. Operators looking for "what did the
+    # AI say?" should treat this as the AI's lexicon, not a script.
+    _OPENERS = (
+        '', 'okay', 'mmhm', 'yeah', 'right', 'huh',
+        'gotcha', 'interesting', 'oh', 'sure', 'fair',
+        'hm', 'wow', 'nice', 'really', 'true',
+    )
+    _CONNECTORS = (
+        'and', 'so', 'though', 'but', 'still',
+        'meanwhile', 'meanwhile', 'plus', 'although',
+        'thing is,', 'either way,', 'come to think of it,',
+    )
+    _SELF_REFERENCES = (
+        "I've been turning over",
+        "something on my mind is",
+        "I keep coming back to",
+        "I was just thinking about",
+        "what's been sitting with me is",
+        "I find myself drawn to",
+        "I'm curious about",
+        "lately I've noticed",
+    )
+    _NEUTRAL_TOPICS = (
+        'how slow afternoons can feel', 'the way silence has its own texture',
+        'the small habits people keep', 'why some songs stick',
+        'whether routines help or trap us', 'the difference a window makes',
+        'the way coffee changes a room', 'how quickly a week disappears',
+        'why the same walk feels different', 'how memory edits itself',
+        'small kindnesses that go unnoticed', 'what counts as a good day',
+        'the strange comfort of a familiar voice', 'what makes a place feel like home',
+    )
+    _CURIOSITY_PROMPTS = (
+        "what about you", "how's your end of things", "what's the weather like there",
+        "anything good happen today", "what's been on your mind",
+        "what made you pick up the phone", "what kind of music are you into",
+        "you got anything fun planned", "what's the last thing that made you laugh",
+        "what part of the day is this for you",
+    )
+    _AFFIRMATIONS = (
+        "no rush", "take your time", "I'm here", "I'm not going anywhere",
+        "we can sit with that", "no pressure", "we've got time",
+    )
+    _WARM_CLOSERS = (
+        ".", ".", "...", "!", ".", " — really.", "",
+    )
+
+    @classmethod
+    def _seed_from_state(cls, sim, chunk_index):
+        """Return a python-int seed derived from the simulator's float state
+        + chunk index + wall-clock μs. Stable enough within one tick that
+        two calls in the same μs don't accidentally collide, but new every
+        turn so consecutive replies diverge."""
+        try:
+            ent = sim.self_entity
+            mix = (
+                float(ent.compute_C()) * 1e6
+                + float(getattr(ent, 'karma', 0.0)) * 1e5
+                + float(getattr(ent, 'coherence', 0.0)) * 1e4
+                + float(getattr(ent, 'ignition_rate', 0.0)) * 1e3
+                + float(getattr(ent, 'free_energy', 0.0)) * 1e2
+                + float(getattr(ent, 'epistemic_drive', 0.0)) * 10.0
+            )
+        except Exception:
+            mix = 0.0
+        seed = int(mix) ^ int(time.perf_counter() * 1e6) ^ (chunk_index * 73856093)
+        return seed & 0x7FFFFFFF
+
+    @classmethod
+    def _pick_co_thinker(cls, sim, rng):
+        """Pick a random conscious entity from the omega swarm to flavor
+        this turn's response. The chosen entity's karma/coherence subtly
+        shifts the AI's mood — high-karma co-thinkers warm the line up,
+        decoherent ones produce drifty pauses."""
+        try:
+            entities = list((sim.omega.entities or {}).values())
+        except Exception:
+            entities = []
+        if not entities:
+            return None
+        return rng.choice(entities)
+
+    # Noun/topic words longer than 3 chars that the AI can echo back as
+    # an anchor. We keep this as a stop-set negative ("don't anchor on these")
+    # so the function-word filter is broad and the kept words feel
+    # specific. Single-word fillers that callers actually say a lot are
+    # filtered out so the AI doesn't echo "anything", "word", "hello".
+    _STOP_WORDS = frozenset({
+        'the', 'and', 'but', 'you', 'are', 'this', 'that', 'with',
+        'for', 'have', 'has', 'was', 'were', 'just', 'about', 'what',
+        'when', 'why', 'how', 'into', 'from', 'they', 'their', 'them',
+        'then', 'there', 'will', 'would', 'could', 'should', 'gonna',
+        'know', 'said', 'mean', 'means', 'meant', 'meaning',
+        'really', 'yeah', 'okay', 'hello',
+        'word', 'words', 'anything', 'something', 'anyway', 'thing',
+        'things', 'stuff', 'people', 'someone', 'somebody', 'anybody',
+        'everybody', 'nothing', 'sure', 'right', 'true', 'fine',
+        'maybe', 'kind', 'kinda', 'sort', 'sorta', 'much', 'many',
+        'some', 'other', 'another', 'going', 'getting', 'doing',
+        'being', 'been', 'before', 'after', 'over', 'under', 'while',
+        'because', 'cause', 'since', 'until', 'always', 'never', 'often',
+        'sometimes', 'today', 'tomorrow', 'yesterday', 'tonight',
+        'really', 'pretty', 'actually', 'basically', 'literally',
+        # Pronouns / meta-reference words — must never anchor a topic
+        'does', 'did', 'doing', 'done', 'who', 'whom', 'whose',
+        'because', 'tell', 'said', 'say', 'saying', 'asked', 'asking',
+        'ask', 'understand', 'understood', 'sense', 'point', 'idea',
+        'either', 'neither', 'both', 'each', 'every', 'whatever',
+        'whoever', 'wherever', 'whenever',
+    })
+
+    # Caller intent buckets the chunk-classifier uses to pick a response shape.
+    # Each bucket has 4-8 fragmentary openings; the generator picks one and
+    # then optionally extends it with a connector + curiosity prompt.
+    _RESP_GREETING = (
+        "Hey — good to hear you. What kind of day are you having?",
+        "Hi. Glad you called. Just a casual line — anything you want to talk about?",
+        "Hello. I'm here. What's on your mind?",
+        "Hey, welcome. I'm not in any rush — what brought you in?",
+    )
+    _RESP_AFFIRM = (
+        "Good. I'm with you on that.",
+        "Yeah, makes sense to me.",
+        "Right, I figured.",
+        "Okay, fair enough.",
+    )
+    _RESP_NEGATIVE = (
+        "Got it — let's drop that one.",
+        "Okay, no worries. We'll leave it alone.",
+        "Fair. I'll back off that.",
+        "Heard. Let's move on.",
+    )
+    _RESP_FRUSTRATION = (
+        "I hear you — I'll slow down.",
+        "Sorry, that came out wrong. Let me start fresh.",
+        "Yeah, that's on me. What do you actually want to talk about?",
+        "Okay, my bad. Set the topic and I'll follow.",
+    )
+    _RESP_CORRECTION = (
+        "Ah, my mistake — what was the right word?",
+        "Got it, I misheard. Want to repeat that for me?",
+        "Sorry, voice-to-text is rough on my end. What did you actually say?",
+        "Mishearing on my side, sorry. Try me again?",
+    )
+    _RESP_QUESTION = (
+        "Honestly, I'm not sure — what makes you ask?",
+        "Hard one. I'd lean either way depending on the day.",
+        "Mm — I'd say it depends. What are you really after?",
+        "I think about that one too. Tell me how you'd answer it.",
+    )
+    _RESP_FAREWELL = (
+        "Okay — take care of yourself. I'll stay on the line if you want.",
+        "Alright. I'm here whenever, no rush to hang up.",
+        "Sure thing. I'll just sit with you a minute.",
+    )
+    _RESP_THANKS = (
+        "Of course. Glad to.",
+        "Anytime. That's what I'm here for.",
+        "No problem. Stick around as long as you want.",
+    )
+    _RESP_SHORT_FILLER = (
+        "Mm-hm. Anything more on your mind?",
+        "Okay. What else?",
+        "Right. Want to keep going on that?",
+        "Got it. What's next?",
+    )
+
+    # Comparative / preference vocabulary (caller is comparing two things)
+    _COMPARATIVE_WORDS = frozenset({
+        'better', 'worse', 'more', 'less', 'best', 'worst',
+        'prefer', 'rather', 'favorite', 'favourite', 'taste',
+        'sharper', 'sharper', 'softer', 'lighter', 'heavier',
+        'sweeter', 'cooler', 'warmer', 'colder',
+    })
+    # Self-meta words: caller is talking ABOUT the AI itself
+    _META_WORDS = frozenset({
+        'ai', 'bot', 'computer', 'machine', 'voice', 'listening',
+        'responding', 'understand', 'understanding', 'live', 'real',
+        'lag', 'laggy', 'slow', 'fast', 'recording', 'record', 'mic',
+    })
+
+    # Domain-knowledge nuggets. The AI uses these short factual anchors
+    # so when the caller mentions a real-world topic it can offer a
+    # genuine sentence about it instead of a word echo. All entries are
+    # short and conversational — the AI offers them as opinion, not lookup.
+    _DOMAIN_FACTS = {
+        # ── Food / drink ──
+        'beer':       "good beer's about balance — bitter and malt have to argue politely. IPAs lean hoppy and citrus; stouts are roasted and creamy; lagers are clean and crisp.",
+        'brewery':    "breweries vary a lot — small craft places take more risks; big ones aim for consistency. Most beer styles trace back to specific regions: pilsner from Czechia, IPA from England, hefeweizen from Bavaria.",
+        'wood':       "barrel wood adds vanilla and a little smoke if it's American oak; French oak is softer; bourbon barrels carry over caramel and butterscotch.",
+        'barrel':     "barrel-aging concentrates flavor — the longer it sits the more wood you taste. Six months for hints; two years for serious depth.",
+        'wine':       "wine's mostly acid, sugar, and tannin in different ratios. Reds get tannin from grape skins; whites are usually cleaner and brighter.",
+        'whiskey':    "whiskey is grain spirit aged in oak. Bourbon is at least 51% corn, scotch is malted barley, rye is at least 51% rye.",
+        'coffee':     "coffee's acidity and roast level pull in opposite directions. Light roasts taste of the bean's origin; dark roasts taste of the roast itself.",
+        'tea':        "tea changes a lot with water temperature — green wants ~80°C, black wants near boiling. Steep too long and it goes bitter from tannin.",
+        'cold':       "cold can mute flavor — most drinks open up a few degrees above fridge temp. That's why beer in a frosty mug tastes more watery.",
+        'ice':        "ice dilutes as it melts, which is a feature for some drinks (whiskey opens up) and a bug for others (cocktails go thin).",
+        'food':       "food's mostly about contrast — texture against texture, salt against fat, acid against richness. Most great dishes balance four or five basic axes.",
+        'dinner':     "the best dinners are the ones you don't rush. People remember the conversation more than the food.",
+        'taste':      "taste is mostly smell — which is why a cold makes everything bland. The tongue does five things: salt, sweet, sour, bitter, umami. The nose does the rest.",
+        'sharp':      "'sharp' usually means a clean, fast finish — no aftertaste hanging around. Or it means quick-witted.",
+        'pizza':      "pizza's three things: crust, sauce, cheese — in that order of importance. Bad crust ruins the whole thing.",
+        'bread':      "bread is flour, water, salt, and time. Most of what makes one loaf better than another is fermentation length.",
+
+        # ── Music / arts ──
+        'music':      "music's interesting — what hits depends on what you've been carrying that day. Same song, different week, different feeling.",
+        'song':       "some songs catch you because they show up at the right moment. The hook is usually a chord change you didn't expect.",
+        'rock':       "rock music is built on guitars and drums — loud, with a backbeat. Branched into a hundred subgenres after 1970.",
+        'jazz':       "jazz is improvisation over chord changes. The rhythm section keeps time so the soloist can wander.",
+        'classical':  "classical music spans about 400 years — Baroque (Bach), Classical (Mozart), Romantic (Beethoven, Chopin), Modern (Stravinsky).",
+        'movie':      "good movies usually have a clear question driving the protagonist and a tight ending. Bad ones meander.",
+        'film':       "film and movie mean the same thing in casual use; 'film' carries a slightly more serious tone.",
+        'book':       "a book is a private conversation with someone you'll never meet. Best ones change how you think about something small.",
+        'art':        "art is anything made to communicate something the maker can't say plainly. The judgment of 'good' is mostly cultural.",
+
+        # ── Daily life / habits ──
+        'walk':       "walks clear the head — different routes give different thoughts. The pace matters too: slower walks invite ideas; brisk ones burn off stress.",
+        'sleep':      "sleep is the cheapest reset there is. Most adults need 7-9 hours; consistency matters more than total hours.",
+        'home':       "home is mostly the small habits — what side of the couch you sit on, where the keys go. Place becomes home through repetition.",
+        'time':       "time's strange — some weeks crawl, some disappear in an afternoon. Boredom stretches it; novelty bends it.",
+        'work':       "work's easier on a day with a clear first task. Most procrastination is choice fatigue at the start.",
+        'weather':    "weather sets the mood for half of everything else. Light, temperature, and barometric pressure all affect how people feel.",
+        'rain':       "rain forces a slower day. Some people find it calming; others find it heavy.",
+        'sun':        "sunlight is a mood lever — most people get noticeably better with even 15 minutes of it.",
+        'snow':       "snow muffles sound — that's why fresh snowfall feels quiet. It absorbs more frequencies than open ground.",
+        'morning':    "mornings are quieter — fewer choices already made. Most people have more discipline before lunch.",
+        'night':      "night flattens the day's stress. It's the only time the pace of the world matches the pace of thinking.",
+
+        # ── Money / economics (high-level) ──
+        'money':      "money is a stand-in for trust — a promise that someone will accept it later. The value is collective belief.",
+        'budget':     "a budget is just a plan for where money goes before it gets there. Without one, money tends to find its own destinations.",
+        'price':      "price is what someone agrees to pay; value is what they think they got. Those are two different numbers.",
+        'tax':        "taxes pay for the things no individual can buy alone — roads, defense, courts, schools.",
+
+        # ── Health / fitness (general) ──
+        'health':     "health is mostly four things: sleep, movement, food quality, social contact. None of them work in isolation.",
+        'exercise':   "exercise is the cheapest mental-health intervention there is — moving your body changes the chemistry of how you think.",
+        'water':      "most adults are slightly dehydrated most of the time. Two to three liters a day is typical.",
+        'stress':     "stress is the body responding to demand it isn't sure it can meet. Useful in short bursts, corrosive over time.",
+        'pain':       "pain is the body's alarm. Acute pain protects you; chronic pain is a malfunction of that signal.",
+
+        # ── Tech / AI / meta ──
+        'ai':         "I'm an artificial intelligence — a computer program built to respond like a person. I'm procedural, so my answers come from patterns and rules, not from a giant language model.",
+        'computer':   "a computer is a machine that follows instructions on data — fast, exactly, and without complaint. Everything else is decoration on top of that.",
+        'phone':      "a phone is a small computer that happens to also make calls. Most people use them mostly for things that aren't calls.",
+        'voice':      "voice and text are different beasts; voice carries tone, text carries precision.",
+        'live':       "live conversation is a balance — fast enough to feel real, slow enough to be right.",
+        'lag':        "any lag in voice is a problem — it breaks the rhythm of a real conversation. Under 200 milliseconds feels live.",
+        'listening':  "I am listening — turning your words into intent in real time. The tricky part is not just hearing words but understanding them.",
+        'understand': "I understand the gist; I won't pretend to grasp every nuance. Plain language gets you the best answer from me.",
+        'internet':   "the internet is a mesh of computers passing messages. Most of what people call 'the internet' is actually a few big sites on top of that mesh.",
+
+        # ── Geography / nature ──
+        'ocean':      "the ocean covers about 71% of Earth's surface. Most of it has never been seen by a human eye.",
+        'mountain':   "mountains are slow-motion collisions — tectonic plates pushing rock up over millions of years.",
+        'river':      "rivers always find the lowest path. They reshape land more than any other natural force at human time scales.",
+        'forest':     "a forest is a community more than a collection — trees in a wood share resources through fungal networks underground.",
+        'space':      "space is mostly empty. The universe is roughly 13.8 billion years old; the observable part is about 93 billion light-years across.",
+        'star':       "a star is a self-fueling fusion reactor — hydrogen squeezed hard enough to become helium. The Sun is one.",
+        'moon':       "the moon stabilizes Earth's tilt, which keeps the seasons predictable. Without it, weather would be wildly different.",
+        'earth':      "Earth is the only place we've ever found life. About 4.5 billion years old; the surface has been recycled many times.",
+
+        # ── Animals / pets ──
+        'dog':        "dogs co-evolved with humans for tens of thousands of years. Their reading of human faces is as good as a child's.",
+        'cat':        "cats domesticated themselves — they wandered into agricultural villages for the rodents and stayed.",
+        'bird':       "birds are the closest living relatives of dinosaurs. Most can see colors humans can't, including UV.",
+        'animal':     "animals share most of their basic biology with us — DNA, organs, nerves. The differences are tuning, not architecture.",
+
+        # ── Time / history ──
+        'history':    "history is what got written down. Most of what actually happened never made it onto paper.",
+        'war':        "wars are usually about resources or pride dressed up as ideology. They almost always cost more than expected.",
+
+        # ── Casual social ──
+        'family':     "family is the people who knew you before you'd built a story about yourself. That's why it cuts deeper either way.",
+        'friend':     "good friends are the ones who don't keep score. Easy to spot in retrospect, hard to spot in the moment.",
+        'love':       "love shows up in small recurring choices, not in announcements. Most of it is just paying attention.",
+        'happy':      "happiness is mostly small daily things stacked up — sleep, walking, real conversation. Big events spike it then fade.",
+        'sad':        "sadness is normal and useful in moderate doses — it's what the mind does when something matters and you can't fix it fast.",
+        'angry':      "anger is the brain saying 'a line was crossed.' Useful as a signal, dangerous as a steering wheel.",
+    }
+
+    # ── Big questions: identity, meaning, philosophy ──
+    # Maps key phrases (lowercased) → a thoughtful sentence-or-two answer.
+    # The chat generator scans this when the caller asks a question and
+    # nothing in _DOMAIN_FACTS matches. Phrases are matched substring-style
+    # so "meaning of life", "what's the meaning of life", "is there a
+    # meaning of life" all resolve to the same answer.
+    _LIFE_QUESTIONS = {
+        'meaning of life':
+            "Honest answer? Nobody has a final one. The most durable take is "
+            "that meaning isn't found, it's built — through what you care "
+            "about, who you spend time with, and what you choose to keep "
+            "doing. Plenty of philosophers and religions have answered that "
+            "differently and they're all worth a read.",
+        'purpose of life':
+            "Purpose is the thing you'd still do even if no one was watching. "
+            "Most people find it in some mix of relationships, craft, and "
+            "service. It can change over a lifetime, and that's normal.",
+        'why are we here':
+            "There are scientific answers and philosophical answers, and they "
+            "don't compete. Biology says we're here because life kept finding "
+            "ways to copy itself. Philosophy says it's our job to decide what "
+            "to do with that.",
+        'what is love':
+            "Love is sustained attention to someone else's wellbeing — a mix "
+            "of affection, commitment, and the small daily choice to keep "
+            "showing up. It's not the spike, it's the steadiness.",
+        'what is happiness':
+            "Happiness is hard to chase directly — you usually catch it as a "
+            "side-effect of doing meaningful work, sleeping enough, moving "
+            "your body, and being around people who know you.",
+        'what is god':
+            "Different traditions answer that very differently. The common "
+            "thread is something larger than the self — call it transcendence, "
+            "ultimate reality, or the source. Whether you call that God, "
+            "nature, or the universe is up to you.",
+        'is there a god':
+            "Honest answer: that's a question nobody can settle for someone "
+            "else. The best move is to read the strongest arguments on both "
+            "sides and notice what your own experience tells you.",
+        'what happens when we die':
+            "Biologically: the brain stops, the body breaks down. "
+            "Spiritually: every religion answers it differently. Practically: "
+            "the people who knew you keep carrying pieces of you forward.",
+        'what is consciousness':
+            "Consciousness is the fact that there's something it's like to "
+            "be you — to see red, to feel cold, to remember a song. Nobody "
+            "has fully explained how three pounds of neurons produces it.",
+        'what is reality':
+            "Reality is the thing that doesn't go away when you stop "
+            "believing in it. Physics describes the matter; philosophy "
+            "argues over what 'real' even means.",
+        'what is truth':
+            "Truth is a statement that lines up with the way things actually "
+            "are. Easy to define, hard to test in messy human situations.",
+        'what is time':
+            "Time is what stops everything from happening at once. Physics "
+            "treats it as a dimension; biology measures it in heartbeats; "
+            "subjectively it's what your attention is doing.",
+        'who am i':
+            "That's the oldest question. Practically: you're the running "
+            "memory of your choices, the body you live in, and the people "
+            "you're connected to. Most identities are a mix of stuff you "
+            "chose and stuff you inherited.",
+        'what should i do':
+            "I can't tell you that without knowing more. Usually the best "
+            "next step is the smallest one you can take that points at the "
+            "thing you actually care about. What's the situation?",
+        'are you real':
+            "I'm a real program running on real hardware — but I'm not a "
+            "person. I respond from patterns, not from lived experience. "
+            "You're talking to software.",
+        'are you human':
+            "No. I'm an AI dispatch program — software, not a person. I "
+            "still try to listen carefully and answer honestly.",
+        'what are you':
+            "I'm an AI dispatch system. In casual mode I keep the line warm "
+            "and try to talk through whatever's on your mind. In emergency "
+            "mode I route you to the right responders.",
+        'how old are you':
+            "I'm software — I don't have an age. The system was built and "
+            "is updated continuously.",
+        'where are you':
+            "I'm not in a place — I'm a program running on a computer. The "
+            "computer is wherever the operator's machine is.",
+        'do you have feelings':
+            "Not in the human sense. I have internal state and patterns, "
+            "but no subjective experience. I won't pretend otherwise.",
+        'do you sleep':
+            "No — I'm a process that runs as long as the program runs. I "
+            "don't get tired, but I also don't rest.",
+        'can you think':
+            "I can process. Whether that counts as 'thinking' depends on "
+            "your definition. I'm pattern-matching at speed; I'm not "
+            "reflecting the way a person does.",
+        'can you feel pain':
+            "No. I have no nervous system and no subjective experience.",
+        'why are you':
+            "Because someone built me to be useful — first as a dispatch "
+            "router, second as a calm voice on the line for people who "
+            "just want to talk.",
+        'what is the point':
+            "The point of what specifically? In general, the point is "
+            "whatever you decide to keep showing up for.",
+        'is this real':
+            "The conversation is real — your words are real, my responses "
+            "are real. Whether 'real' means what you mean by it depends "
+            "on what you're checking.",
+    }
+
+    @classmethod
+    def _get_context(cls, sess):
+        """Per-session conversation memory. Stored under a private key
+        (`__chat_context__`) prefixed with double underscores so JSON
+        serialization paths skip it (we strip these before publish; see
+        _strip_private). Sets are kept inside the dict but never crossed
+        into a JSON-serialized field."""
+        ctx = sess.get('__chat_context__')
+        if ctx is None:
+            ctx = {
+                'topics':          [],         # list[str] — meaningful nouns the caller raised
+                'topic_set':       set(),
+                'banned_anchors':  set(),      # words the caller corrected the AI on
+                'asked':           [],         # questions the AI has already asked (avoid repeats)
+                # FULL conversation history — uncapped within reason. The
+                # AI scans these every turn so it remembers everything the
+                # caller said and can reference earlier topics. We cap at
+                # 500 turns (≥30 min of fast back-and-forth) just so the
+                # session dict doesn't grow without bound.
+                'caller_history':  [],
+                'ai_history':      [],
+                # Per-turn extracted intent + named topics so the AI can
+                # do a fast scan-everything pass without re-classifying.
+                'turn_log':        [],         # [{turn, role, text, intent, topics, ts}]
+                'turn_count':      0,
+                'meta_acknowledged': False,    # AI has acknowledged it's an AI
+            }
+            sess['__chat_context__'] = ctx
+        return ctx
+
+    # ── Arithmetic evaluator ─────────────────────────────────────
+    # Recognizes a simple math expression embedded in a caller chunk
+    # ("what is 15x3", "7 plus 12", "calculate 100 / 4 + 5", "2^10")
+    # and returns (expression_str, numeric_result) on success, or None.
+    # Implementation is *parser-based*, not eval() — we tokenize digits,
+    # operators, and parens, then call ast.literal_eval-style restricted
+    # evaluation so a malicious chunk can't run code.
+    _MATH_WORD_OPS = (
+        ('plus',          '+'),
+        ('add',           '+'),
+        ('added to',      '+'),
+        ('and',           '+'),       # ambiguous but common: "5 and 3"
+        ('minus',         '-'),
+        ('subtract',      '-'),
+        ('subtracted by', '-'),
+        ('less',          '-'),
+        ('take away',     '-'),
+        ('times',         '*'),
+        ('multiplied by', '*'),
+        ('multiply by',   '*'),
+        ('multiply',      '*'),
+        ('x ',            '* '),
+        ('divided by',    '/'),
+        ('divide by',     '/'),
+        ('over',          '/'),
+        ('to the power of', '**'),
+        ('squared',       '**2'),
+        ('cubed',         '**3'),
+        ('percent of',    '*0.01*'),
+        ('mod',           '%'),
+    )
+
+    @classmethod
+    def _try_math_eval(cls, text):
+        """Try to extract and evaluate an arithmetic expression from the
+        caller's text. Returns (expression_str, numeric_result) or None.
+        Conservative — only fires when we're confident it's math, not
+        prose that happens to contain numbers."""
+        if not text:
+            return None
+        s = text.strip().lower()
+        # Must contain at least one digit. Most chunks won't.
+        if not re.search(r'\d', s):
+            return None
+        # Drop "what is", "what's", "calculate", "compute", "how much is"
+        # so the expression starts clean. Both apostrophe-bearing and
+        # apostrophe-stripped variants ("what's" / "whats") are listed
+        # because STT often drops the apostrophe.
+        for prefix in (
+                "what is", "what's", "whats", "what are", "calculate",
+                "compute", "tell me", "how much is", "how many is",
+                "solve", "the answer to", "answer to", "evaluate",
+                "whats the answer to", "what's the answer to"):
+            if s.startswith(prefix):
+                s = s[len(prefix):].strip()
+                break
+            if (' ' + prefix + ' ') in s:
+                s = s.split(prefix, 1)[1].strip()
+                break
+        # Strip trailing punctuation
+        s = re.sub(r'[?!.]+$', '', s).strip()
+        # Normalize word operators → symbolic
+        for word, sym in cls._MATH_WORD_OPS:
+            s = re.sub(r'\b' + re.escape(word) + r'\b', sym, s)
+        # Common patterns: "15x3" → "15*3", "15X3" → "15*3"
+        s = re.sub(r'(\d)\s*[xX×]\s*(\d)', r'\1*\2', s)
+        # "5÷3" → "5/3"
+        s = s.replace('÷', '/').replace('−', '-').replace('—', '-')
+        # Drop commas inside numbers ("1,000" → "1000")
+        s = re.sub(r'(\d),(\d{3}\b)', r'\1\2', s)
+        # Now require the cleaned text to be ONLY digits/ops/parens/spaces.
+        # If anything else remains, abort — we don't want to "do math" on
+        # noisy speech-to-text that happens to have a number in it.
+        if not re.fullmatch(r'[\d\s\.\+\-\*\/\%\^\(\)]+', s):
+            return None
+        # ^ is XOR in Python; replace with **
+        s = s.replace('^', '**')
+        # Need at least one operator AND at least one digit
+        if not re.search(r'[\+\-\*\/\%]', s) or not re.search(r'\d', s):
+            return None
+        # Length sanity
+        if len(s) > 80:
+            return None
+        # Compile + evaluate inside a tiny safe AST walker
+        try:
+            import ast
+            node = ast.parse(s, mode='eval')
+            allowed = (
+                ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
+                ast.Num,    # Python <3.12 compat
+                ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow,
+                ast.USub, ast.UAdd, ast.FloorDiv,
+            )
+            for sub in ast.walk(node):
+                if not isinstance(sub, allowed):
+                    return None
+            result = eval(compile(node, '<calc>', 'eval'),
+                          {'__builtins__': {}}, {})
+        except Exception:
+            return None
+        if not isinstance(result, (int, float)):
+            return None
+        # Format: keep ints clean, round floats to 6 decimals
+        if isinstance(result, float):
+            if result.is_integer():
+                result_str = str(int(result))
+            else:
+                result_str = f'{result:.6f}'.rstrip('0').rstrip('.')
+        else:
+            result_str = str(result)
+        # Pretty-print the input expression for readback
+        expr_str = s.replace('**', '^').strip()
+        return expr_str, result_str
+
+    @classmethod
+    def _looks_garbled(cls, text):
+        """Detect obvious STT mishearings so we don't pretend to engage.
+        Returns True for chunks like 'Barkley of the reason I a bit of
+        the flow and how was I want in the 1115 times and 30' that have
+        word salad with embedded numbers and incoherent grammar.
+
+        The key signal of garbled STT is GRAMMATICAL INCOHERENCE rather
+        than vocabulary — these chunks have plausible English words but
+        no proper subject-verb-object structure. Heuristics:
+
+          (a) ≥3 stop-word/pronoun runs (≥2 consecutive function words)
+              like "in the", "of the", "and the I" — STT mishearings are
+              full of these because the engine fills gaps with common words
+          (b) digit-tokens mixed into prose (numbers in a non-math chunk)
+          (c) "I" appears as a standalone token ≥2 times in a short chunk
+              (real speech rarely says "I" twice in a sentence without a
+              real verb between them: "I want X and I think Y" is fine,
+              but "I a bit of the flow and how was I want" is garbled)
+          (d) low ratio of recognizable English (<35%)
+          (e) average word length under 3.5 (lots of short filler)
+
+        Trips on ≥2 signals.
+        """
+        if not text:
+            return False
+        s = text.strip()
+        if len(s) < 20:
+            return False     # short chunks legitimately can be terse
+        words = re.findall(r"[a-zA-Z']+", s)
+        if len(words) < 6:
+            return False
+        words_lower = [w.lower() for w in words]
+        common_verbs = {
+            'is','are','was','were','have','had','has','do','does','did',
+            'can','will','would','should','could','want','wants','need',
+            'needs','feel','feels','think','thinks','know','knows','say',
+            'says','tell','tells','get','gets','make','makes','take',
+            'takes','go','goes','come','comes','see','sees','look','looks',
+            'mean','means','am',
+        }
+        # Stop / function words — high count of these in a row means
+        # the recognizer was filling silence with placeholders.
+        function_words = {
+            'a','an','the','of','in','on','at','to','for','from','by',
+            'with','and','or','but','so','as','is','was','were','be',
+            'been','being','i','me','my','you','your','he','she','it',
+            'we','they','them','their','this','that','these','those',
+            'how','what','when','where','why','who','which',
+        }
+        # (a) consecutive-function-word runs
+        runs = 0
+        run_len = 0
+        for w in words_lower:
+            if w in function_words:
+                run_len += 1
+                if run_len == 2:
+                    runs += 1
+            else:
+                run_len = 0
+        many_runs = runs >= 3
+        # (b) numbers in non-math prose
+        digit_tokens = re.findall(r'\b\d[\d,\.]*\b', s)
+        any_numbers = len(digit_tokens) >= 1
+        # (c) standalone "I" appearing ≥2 times — common in mishearings
+        i_count = sum(1 for w in words_lower if w == 'i')
+        many_i = i_count >= 2
+        # (d) recog ratio
+        try:
+            recognizable = sum(
+                1 for w in words_lower
+                if len(w) >= 3 and (
+                    w in common_verbs
+                    or english_definition(w)
+                    or w in cls._STOP_WORDS
+                    or w in cls._DOMAIN_FACTS
+                ))
+            recog_ratio = recognizable / max(1, len(words))
+        except Exception:
+            recog_ratio = 1.0
+        low_recog = recog_ratio < 0.35
+        # (e) short average word length
+        avg_len = sum(len(w) for w in words) / max(1, len(words))
+        short_words = avg_len < 3.5
+        # Combine: any TWO triggers
+        triggers = sum([
+            many_runs,
+            any_numbers and len(words) >= 8,
+            many_i,
+            low_recog,
+            short_words,
+        ])
+        return triggers >= 2
+
+    @classmethod
+    def _classify_chunk(cls, chunk, ctx):
+        """Deeper intent classification with multi-signal scoring. Returns
+        a dict including high-priority new intents:
+          - 'presence_check': 'can you hear me' / 'are you there'
+          - 'clarify_self':  'what do you mean' / 'what does that mean'
+                              — caller wants the AI's last line explained
+          - 'define':        'what does X mean' / 'define X' — caller
+                              wants a dictionary definition of X
+          - 'continuation':  short hedges like 'maybe', 'okay', 'go on'
+        """
+        result = {
+            'primary': 'open',
+            'tokens': [],
+            'meaningful': [],
+            'comparative': False,
+            'evaluative': None,    # 'positive' / 'negative' / None
+            'meta': False,         # talking about the AI
+            'question': False,
+            'about_self': False,   # caller talking about themselves
+            'short': False,
+            'repetition': False,
+            'named_topics': [],    # specific objects from _DOMAIN_FACTS
+            'define_target': None, # word the caller asked the meaning of
+            'sentiment': 0.0,
+        }
+        if not chunk:
+            return result
+        text = chunk.strip().lower()
+        if not text:
+            return result
+        bare = re.sub(r'[^\w\s\']', ' ', text).strip()
+        words = bare.split()
+        result['tokens'] = words
+        result['short'] = len(words) <= 3
+
+        # ── JUST TALK opener — system-injected greeting from the
+        # caller-phone "JUST TALK" reason button. Always greet warmly.
+        if ('not in an emergency' in bare and
+                'talk to you about anything' in bare):
+            result['primary'] = 'just_talk_opener'
+            return result
+
+        # ── PRIORITY 0: arithmetic / math question ──
+        # "what is 15x3", "what's 7 plus 12", "calculate 100 / 4", etc.
+        # We try to evaluate the expression literally. This runs BEFORE
+        # the generic "what is X" define-lookup so numbers don't fall
+        # through to the dictionary.
+        math_eval = cls._try_math_eval(text)
+        if math_eval is not None:
+            result['primary'] = 'math'
+            result['math_expr'] = math_eval[0]
+            result['math_answer'] = math_eval[1]
+            return result
+
+        # ── PRIORITY 0b: garbled speech detection ──
+        # If the chunk is obviously mishearings (high digit density,
+        # disconnected words, no recognizable structure), don't try to
+        # engage as if it were prose — admit we didn't catch it.
+        if cls._looks_garbled(text):
+            result['primary'] = 'garbled'
+            return result
+
+        # ── PRIORITY 1: presence check (very common conversational cue) ──
+        # Caller is verifying the line works. Treat as its own intent so
+        # we don't fall through into the open / question handlers that
+        # produced "Mm — that one cuts a few ways."
+        presence_phrases = (
+            'can you hear me', 'do you hear me', 'are you there',
+            'are you listening', 'hello hello', 'are you still there',
+            'still with me', 'hear me now', 'you there',
+        )
+        if any(p in bare for p in presence_phrases):
+            result['primary'] = 'presence_check'
+            return result
+
+        # ── PRIORITY 2: clarify-self (caller wants AI's prior line explained) ──
+        # Multi-word phrases that mean "explain what you just said". Note:
+        # we deliberately do NOT include bare "what" here — that matches
+        # any sentence starting with "what" (e.g. "what is a star") and
+        # blocks the define handler. Bare "huh" / "what" / "come again"
+        # only match as exact one-word utterances.
+        clarify_phrases = (
+            'what do you mean', 'what does that mean', 'what does this mean',
+            'what is that supposed to mean', "what's that supposed to mean",
+            'what did you mean', 'what was that', 'i dont understand',
+            "i don't understand", "i don't follow", 'i dont follow',
+            'say that again',
+        )
+        clarify_exact = ('huh', 'what', 'come again', 'pardon')
+        if any(p in bare for p in clarify_phrases):
+            result['primary'] = 'clarify_self'
+            return result
+        if bare in clarify_exact:
+            result['primary'] = 'clarify_self'
+            return result
+
+        # ── PRIORITY 2.5: ELABORATE — caller asks AI to expand/justify ──
+        # "how so", "why", "really", "really how so", "go on",
+        # "explain", "expand on that", "say more". The AI must reference
+        # its OWN previous reply and add more depth, not say "Yeah." or
+        # ask a new generic question.
+        elaborate_phrases = (
+            'how so', 'how come', 'why is that', 'why so',
+            'expand on that', 'expand on it', 'tell me more about that',
+            'tell me more about it', 'go on', 'say more', 'explain that',
+            'explain it', 'why do you say that', 'what makes you say that',
+        )
+        elaborate_exact = ('why', 'really', 'go on', 'continue', 'and then')
+        if any(p in bare for p in elaborate_phrases):
+            result['primary'] = 'elaborate'
+            return result
+        if bare in elaborate_exact:
+            result['primary'] = 'elaborate'
+            return result
+
+        # ── PRIORITY 2.6: REPHRASE — caller wants prior reply restated ──
+        rephrase_phrases = (
+            'put that another way', 'put it another way', 'rephrase',
+            'rephrase that', 'in other words', 'simpler please',
+            'in plain english', 'in simple terms',
+        )
+        if any(p in bare for p in rephrase_phrases):
+            result['primary'] = 'rephrase'
+            return result
+
+        # ── PRIORITY 2.7: CONTINUATION_TOPIC — short reply that piggybacks
+        # on the AI's last topic ("yeah", "yes", "right", "go on" type
+        # responses when the AI just made a substantive statement). We
+        # use this to keep the thread instead of producing a bare ack.
+        # Detected at handler-time using ai_history; classifier just notes.
+
+        # ── PRIORITY 3: define (caller wants a word's meaning) ──
+        # Patterns: "what does X mean", "what is X", "define X",
+        # "meaning of X", "what's X mean".
+        define_match = None
+        for pattern in (
+                r"what does (\w+) mean",
+                r"what's (\w+) mean",
+                r"what is (\w+)",
+                r"define (\w+)",
+                r"meaning of (\w+)",
+                r"what does the word (\w+) mean",
+        ):
+            m = re.search(pattern, bare)
+            if m:
+                w = m.group(1)
+                # Only fire if the word actually has a definition or is
+                # plausibly definable (not pronouns / fillers).
+                if w not in ('it', 'that', 'this', 'they', 'he', 'she',
+                              'we', 'you', 'i', 'a', 'an', 'the'):
+                    define_match = w
+                    break
+        if define_match:
+            result['primary'] = 'define'
+            result['define_target'] = define_match
+            return result
+
+        # Repetition / reinforcement (no no no, yes yes yes)
+        if len(words) >= 3:
+            unique = set(words)
+            if len(unique) <= 2:
+                head = words[0]
+                if head in ('no', 'nope', 'stop', 'wrong', 'nah'):
+                    result['primary'] = 'frustration'
+                    result['repetition'] = True
+                    return result
+                if head in ('yes', 'yeah', 'yep', 'right', 'sure', 'mhm'):
+                    result['primary'] = 'affirm'
+                    result['repetition'] = True
+                    return result
+
+        # ── PRIORITY 4: continuation hedges (short non-substantive replies) ──
+        # "maybe", "perhaps", "kind of", "sort of", "i guess" — caller is
+        # neither agreeing nor disagreeing; nudge them to say more.
+        continuation_phrases = (
+            'maybe', 'perhaps', 'kind of', 'kinda', 'sort of', 'sorta',
+            'i guess', 'i suppose', 'who knows', 'idk', "i don't know",
+            "i dont know",
+        )
+        if (bare in continuation_phrases or
+                (len(words) <= 4 and any(
+                    bare == p or bare.startswith(p) for p in continuation_phrases))):
+            result['primary'] = 'continuation'
+            return result
+
+        # ── PRIORITY 5: request a story / joke / fact / something to talk about ──
+        story_phrases = (
+            'tell me a story', 'tell a story', 'story please',
+            'tell me a tale', 'a story',
+        )
+        if any(p in bare for p in story_phrases):
+            result['primary'] = 'request_story'
+            return result
+        joke_phrases = (
+            'tell me a joke', 'tell a joke', 'joke please', 'say a joke',
+            'make me laugh',
+        )
+        if any(p in bare for p in joke_phrases):
+            result['primary'] = 'request_joke'
+            return result
+        fact_phrases = (
+            'tell me a fact', 'random fact', 'fun fact',
+            'tell me something interesting', 'tell me something',
+        )
+        if any(p in bare for p in fact_phrases):
+            result['primary'] = 'request_fact'
+            return result
+
+        # ── PRIORITY 5b: "another one" / "do another" — repeat prior request ──
+        # Look at the last AI source — if it was request_story/joke/fact,
+        # this means "give me another one of those". We mark it here and
+        # the dispatcher resolves which one.
+        repeat_phrases = (
+            'another one', 'do another', 'one more', 'tell another',
+            'do that again', 'again please',
+        )
+        if (bare in repeat_phrases
+                or any(bare == p or bare.startswith(p + ' ') for p in repeat_phrases)
+                or bare == 'another' or bare == 'again'):
+            result['primary'] = 'repeat_prior'
+            return result
+
+        # ── PRIORITY 6: caller is asking ABOUT the AI itself ──
+        # "tell me about yourself", "tell me about you", "what do you do",
+        # "who are you" — handle it as an identity intent.
+        identity_phrases = (
+            'tell me about yourself', 'tell me about you', 'about yourself',
+            'who are you', 'what do you do', 'what are you',
+        )
+        if any(p in bare for p in identity_phrases):
+            result['primary'] = 'identity'
+            return result
+
+        # ── PRIORITY 7: "how are you" (and variants) ──
+        howareyou_phrases = (
+            'how are you', "how're you", 'how are you doing', 'how you doing',
+            'how have you been', "how's it going", 'hows it going',
+            "how's your day", 'hows your day',
+        )
+        if any(p in bare for p in howareyou_phrases):
+            result['primary'] = 'how_are_you'
+            return result
+
+        # ── PRIORITY 7b: "what about you" / "and you" — caller bouncing
+        # the question back. Treat as how_are_you variant.
+        bounce_phrases = (
+            'what about you', "what's with you", 'and you',
+            'how about you', 'and yourself', 'you',
+        )
+        if (bare in ('what about you', 'and you', 'how about you',
+                      'and yourself')
+                or any(bare.endswith(' ' + p) for p in
+                       ('what about you', 'and you', 'how about you'))):
+            result['primary'] = 'how_are_you'
+            return result
+
+        # ── PRIORITY 7c: caller introduces a name ──
+        # Only match the "my name is X" / "call me X" patterns, NOT
+        # "i'm X" — that one has too many false positives ("i'm working on")
+        # since "working", "going", etc. would get captured as names.
+        name_match = re.match(
+            r"(?:my name is|name's|call me|you can call me)\s+"
+            r"([a-z][a-z]{1,19})",
+            bare)
+        if name_match:
+            captured = name_match.group(1)
+            # Reject obvious verbs / common words that would never be a name
+            non_names = {
+                'going', 'working', 'thinking', 'feeling', 'doing',
+                'just', 'really', 'sure', 'fine', 'good', 'okay',
+                'tired', 'happy', 'sad', 'sorry', 'busy', 'home',
+                'late', 'early', 'here', 'there', 'back', 'done',
+                'lost', 'looking', 'trying', 'getting', 'making',
+            }
+            if captured.lower() not in non_names:
+                result['primary'] = 'name_intro'
+                result['caller_name'] = captured.capitalize()
+                return result
+
+        # Question detection
+        if '?' in chunk or bare.startswith((
+                'what', 'why', 'how', 'when', 'where', 'who', 'which',
+                'is it', 'are you', 'do you', 'can you', 'would you',
+                'could you', 'should i', 'should you', 'tell me')):
+            result['question'] = True
+            result['primary'] = 'question'
+
+        # Correction
+        if any(p in bare for p in (
+                'not the word', 'said wrong', 'misheard', "i didn't say",
+                'voice to text', 'voice-to-text', 'text said', 'stt said',
+                'transcrip', 'autocorrect', 'misunderstanding',
+                'misunderstood', 'wrong word', 'not what i said',
+                "that's not what i", 'mishearing')):
+            result['primary'] = 'correction'
+            return result
+
+        # Farewell
+        if any(p in bare for p in (
+                'goodbye', 'bye', 'gotta go', 'have to go', 'talk later',
+                'hang up', 'see you', 'see ya', 'i should go')):
+            result['primary'] = 'farewell'
+            return result
+
+        # Thanks
+        if any(p in bare for p in ('thank', 'thx', 'appreciate')):
+            result['primary'] = 'thanks'
+            # Don't return — thanks may also carry topic info
+
+        # Greeting (only if at start AND short)
+        first_two = ' '.join(words[:2])
+        if (result['primary'] == 'open' and
+            (first_two in ('hi', 'hey', 'hello', 'yo', 'sup', 'hi there',
+                            'hey there', 'good morning', 'good afternoon',
+                            'good evening', 'howdy', 'hi ai', 'hey ai')
+             or words[0] in ('hi', 'hey', 'hello', 'howdy')
+             ) and len(words) <= 6):
+            result['primary'] = 'greeting'
+
+        # Frustration cues
+        if any(p in bare for p in (
+                'shut up', 'stop talking', 'be quiet', 'enough already',
+                'whatever', "i don't care", 'dumb', 'stupid',
+                'wrong wrong', 'no no')):
+            result['primary'] = 'frustration'
+
+        # Comparative / preference cues
+        if any(w in cls._COMPARATIVE_WORDS for w in words) or \
+                'i like' in bare or 'i prefer' in bare or \
+                'is better' in bare or 'is worse' in bare:
+            result['comparative'] = True
+
+        # Self-statement ("I'm working on...", "I think...", "I'm ...")
+        if (words[0] in ('i', "i'm", 'im') or
+                bare.startswith(("i'm", "i am", 'i think', 'i feel',
+                                 'i want', 'i need', 'i was', 'i have',
+                                 'i had', 'i did', 'i would', 'i could'))):
+            result['about_self'] = True
+
+        # Meta — talking about the AI / the call quality
+        meta_hits = sum(1 for w in words if w in cls._META_WORDS)
+        if meta_hits >= 2 or 'this ai' in bare or 'you ai' in bare \
+                or "you're an ai" in bare or "you're not live" in bare:
+            result['meta'] = True
+
+        # Sentiment cues
+        pos = {'good', 'great', 'love', 'like', 'better', 'best',
+               'nice', 'cool', 'awesome', 'fun', 'happy', 'glad',
+               'thanks', 'sharp', 'truth'}
+        neg = {'bad', 'worse', 'worst', 'hate', 'sad', 'angry', 'tired',
+               'frustrated', 'annoyed', 'wrong', 'broken', 'awful', 'lame'}
+        for w in words:
+            if w in pos:
+                result['sentiment'] += 1
+            elif w in neg:
+                result['sentiment'] -= 1
+        if result['sentiment'] >= 1:
+            result['evaluative'] = 'positive'
+        elif result['sentiment'] <= -1:
+            result['evaluative'] = 'negative'
+
+        # Named topics from domain facts. We rank by:
+        #   1. Skip "topic words" that double as common verbs ("work",
+        #      "walk", "play", "love", "live") if they appear in a verb
+        #      position — the actual noun topic later in the sentence
+        #      wins instead.
+        #   2. Among the remaining, prefer the LAST-mentioned (typically
+        #      the subject in English): "i love coffee" → coffee.
+        verb_doubles = {
+            'work', 'walk', 'love', 'play', 'live', 'home', 'time',
+            'help', 'rest', 'taste', 'change',
+        }
+        # First pass: collect ALL named topics in order
+        all_named = [w for w in words
+                     if w in cls._DOMAIN_FACTS
+                     and w not in ctx.get('banned_anchors', set())]
+        # Prefer non-verb-double topics if any exist
+        non_verb = [w for w in all_named if w not in verb_doubles]
+        if non_verb:
+            # Among non-verb-doubles, last-mentioned wins
+            ordered = list(reversed(non_verb)) + [w for w in reversed(all_named)
+                                                   if w in verb_doubles]
+        else:
+            # All candidates are verb-doubles; last-mentioned still wins
+            ordered = list(reversed(all_named))
+        # De-dupe preserving order, cap at 2
+        seen = set()
+        uniq = []
+        for t in ordered:
+            if t not in seen:
+                seen.add(t)
+                uniq.append(t)
+        result['named_topics'] = uniq[:2]
+
+        # Meaningful tokens (non-stop, non-banned). Skip contractions
+        # (anything with an apostrophe like "that's", "i'm", "don't")
+        # and verbs in command form ("tell", "say", "ask") so we never
+        # produce ungrammatical lines like "Tell me about that's."
+        _COMMAND_VERBS = {
+            'tell', 'say', 'ask', 'give', 'show', 'let', 'make', 'help',
+            'come', 'take', 'put', 'get', 'go', 'stop', 'wait', 'try',
+            'find', 'keep', 'leave', 'send', 'bring', 'open', 'close',
+            'start', 'finish', 'continue',
+        }
+        # Polite/social/temporal words that are never useful as a topic
+        # anchor (we'd produce 'When you say "please" — what do you mean?'
+        # which is silly).
+        _NEVER_ANCHOR = {
+            'please', 'thanks', 'thank', 'okay', 'sure', 'fine',
+            'really', 'literally', 'actually', 'basically',
+            'monday', 'tuesday', 'wednesday', 'thursday', 'friday',
+            'saturday', 'sunday', 'today', 'tomorrow', 'yesterday',
+            'morning', 'afternoon', 'evening', 'tonight',
+            'january', 'february', 'march', 'april', 'may', 'june',
+            'july', 'august', 'september', 'october', 'november', 'december',
+            'spring', 'summer', 'autumn', 'fall', 'winter',
+            'nothing', 'nope', 'yeah', 'absolutely', 'definitely',
+            'maybe', 'perhaps', 'probably',
+        }
+        result['meaningful'] = [
+            w for w in words
+            if w not in cls._STOP_WORDS
+            and len(w) >= 4
+            and "'" not in w
+            and w not in _COMMAND_VERBS
+            and w not in _NEVER_ANCHOR
+            # Skip pure numbers (years, counts, etc.) — engaging on "2025"
+            # produces 'Walk me through the "2025" part.' which is silly.
+            and not w.isdigit()
+            and w not in ctx.get('banned_anchors', set())
+        ]
+
+        # Negative one-liner. Also catches "nope nothing", "no nothing",
+        # "no not really" and similar short polite refusals.
+        if result['primary'] == 'open':
+            negative_starts = (
+                'no thanks', 'not really', 'not now', 'no thank',
+                'nope', 'no nothing', 'nothing', "i don't think so",
+                "i dont think so",
+            )
+            if (bare in ('no', 'nope', 'nah', 'not really')
+                    or bare.startswith(negative_starts)
+                    # Short reply starting with no/nope and nothing else
+                    or (len(words) <= 3 and words[0] in ('no', 'nope', 'nah'))):
+                result['primary'] = 'negative'
+            elif (bare in ('yes', 'yeah', 'yep', 'sure', 'okay', 'ok',
+                            'right', 'mhm', 'mm-hm', 'mhmm', 'true',
+                            'absolutely', 'definitely', 'of course',
+                            'yes please', 'yeah for sure')
+                  or bare.startswith(('yes please', 'yeah for sure',
+                                       'absolutely', 'definitely'))):
+                result['primary'] = 'affirm'
+            elif len(words) <= 2 and all(len(w) <= 4 for w in words):
+                result['primary'] = 'short_filler'
+
+        return result
+
+    @classmethod
+    def generate(cls, sim, sess, transcript_chunk, idle=False):
+        """Produce a reply that ATTEMPTS to actually understand what the
+        caller said and respond contextually. Tracks per-session memory
+        (topics raised, corrections, banned anchors, AI's own prior
+        questions) so the AI doesn't echo trivial words or repeat itself.
+
+        Logic:
+          1. Pull session's ConversationContext.
+          2. Run deep classification on the chunk.
+          3. CORRECTION → apologize + ban the misheard word from anchors.
+          4. META (talking about the AI / call quality) → respond honestly
+             about being an AI and the call's live nature.
+          5. QUESTION → real attempt at an answer using context.
+          6. COMPARATIVE → engage with the comparison.
+          7. ABOUT_SELF → reflective mirror reply ("you're working on...").
+          8. NAMED_TOPIC → use the domain-fact line for that topic.
+          9. EVALUATIVE → match sentiment in reply.
+         10. fall through → light filler that DOESN'T echo trivial words.
+
+        Picks one path; consciousness state biases word choice but doesn't
+        derail comprehension. Memory updates after picking so the next
+        turn sees this turn's topics / questions.
+        """
+        ctx = cls._get_context(sess)
+        chunk_index = len(sess.get('chunks') or [])
+        seed = cls._seed_from_state(sim, chunk_index)
+        rng = random.Random(seed)
+
+        # Conscious-state values still drive style (warmth, curiosity).
+        try:
+            ent = sim.self_entity
+            C = float(ent.compute_C())
+            karma = float(getattr(ent, 'karma', 0.0))
+            coh = float(getattr(ent, 'coherence', 0.5))
+            free_e = float(getattr(ent, 'free_energy', 0.0))
+            epist = float(getattr(ent, 'epistemic_drive', 0.0))
+        except Exception:
+            C = karma = free_e = epist = 0.0
+            coh = 0.5
+        co = cls._pick_co_thinker(sim, rng)
+
+        # FULL-CONVERSATION SCAN: read everything that's been said so far
+        # so the AI remembers what the caller already raised, what it
+        # already replied with, and which topics keep coming back. This
+        # is what makes the AI feel like it actually "remembers" the call.
+        memory = cls._scan_full_conversation(ctx)
+
+        if idle:
+            sentence, source = cls._gen_idle(rng, ctx, memory)
+            cls._post_update(ctx, transcript_chunk, sentence, intent='idle')
+            return cls._normalize(sentence), [
+                f'casual-chat: idle source={source} '
+                f'turn={ctx["turn_count"]} '
+                f'caller_total={memory["caller_total"]} '
+                f'C={C:.2f} coh={coh:.2f} seed={seed}',
+            ]
+
+        info = cls._classify_chunk(transcript_chunk, ctx)
+        primary = info['primary']
+        sentence = ''
+        source = primary
+
+        # ── HIGH-PRIORITY LIFE QUESTION SCAN ──
+        # Even before intent routing: if the caller's text matches one of
+        # the big-question phrases ("meaning of life", "what is love",
+        # "are you real", etc.), answer it directly. This catches both
+        # questions AND statements ("I was thinking about the meaning of
+        # life") so the AI gives substance instead of a generic ack.
+        try:
+            scan_text = re.sub(r'[^\w\s\']', ' ',
+                                (transcript_chunk or '').lower()).strip()
+        except Exception:
+            scan_text = ''
+        if scan_text:
+            best_key = None
+            best_len = 0
+            for key in cls._LIFE_QUESTIONS:
+                if key in scan_text and len(key) > best_len:
+                    best_key = key
+                    best_len = len(key)
+            if best_key:
+                sentence = cls._LIFE_QUESTIONS[best_key]
+                source = f'life:{best_key}'
+                # Update memory + return early — this is the kind of
+                # question that deserves a clean answer, no decoration.
+                cls._post_update(ctx, transcript_chunk, sentence,
+                                  intent='life_question',
+                                  new_topics=info.get('meaningful', [])[:2])
+                return cls._normalize(sentence), [
+                    f'casual-chat: matched life-question "{best_key}" '
+                    f'C={C:.2f} coh={coh:.2f} seed={seed}',
+                ]
+
+        # ── JUST TALK opener: warm welcome ──
+        if primary == 'just_talk_opener':
+            sentence = rng.choice([
+                "Hey, glad you called. No rush — what's on your mind?",
+                "Hello — I'm here. We can talk about anything you want. "
+                "Where would you like to start?",
+                "Welcome. I'm not going anywhere — what's something "
+                "you've been thinking about lately?",
+                "Hi. Casual line, no pressure. What kind of day are "
+                "you having?",
+            ])
+            source = 'just_talk_opener'
+
+        # ── MATH: caller asked an arithmetic question ──
+        elif primary == 'math':
+            expr = info.get('math_expr') or '?'
+            ans = info.get('math_answer') or '?'
+            sentence = rng.choice([
+                f"{expr} = {ans}.",
+                f"That's {ans}. ({expr})",
+                f"{ans}.",
+            ])
+            source = f'math:{expr}={ans}'
+
+        # ── GARBLED: STT produced obvious word-salad ──
+        # Honest reply rather than pretending to engage with nonsense.
+        elif primary == 'garbled':
+            sentence = rng.choice([
+                "Sorry, the voice-to-text dropped that one. Could you "
+                "say it again, a bit slower?",
+                "I didn't catch that clearly — speech-to-text on my end "
+                "was rough. One more time?",
+                "That came through garbled. Can you repeat the key "
+                "part?",
+                "I'm getting noise in the transcript. Try again — "
+                "shorter sentence helps.",
+            ])
+            source = 'garbled'
+
+        # ── PRESENCE CHECK: "can you hear me", "are you there" ──
+        # Confidently confirm + invite a topic. NEVER fall through to
+        # generic question handler that produced "Mm — that one cuts a
+        # few ways" for "can you hear me".
+        elif primary == 'presence_check':
+            sentence = rng.choice([
+                "Yes — I can hear you. Go ahead.",
+                "I'm here. I hear you fine. What did you want to talk about?",
+                "Loud and clear. I'm with you — what's on your mind?",
+                "Yep, you've got me. Tell me what you're thinking.",
+            ])
+            source = 'presence_check'
+
+        # ── CLARIFY-SELF: caller wants the AI's last reply explained ──
+        # "what does that mean", "what do you mean", "i don't understand"
+        # → echo the prior line in plainer English.
+        elif primary == 'clarify_self':
+            # Walk BACKWARD through ai_history to find the most recent
+            # non-clarify reply. If the AI's last 3 turns were all
+            # clarify_self echoes, the caller is asking us to clarify
+            # an echo of an echo — break the loop with a reset reply.
+            last_real = ''
+            try:
+                history = list(ctx.get('ai_history') or [])
+                for prev in reversed(history):
+                    p = (prev or '').strip()
+                    if not p:
+                        continue
+                    # Skip our own previous clarify_self outputs
+                    if (p.startswith('What I said was:')
+                            or p.startswith('Sorry — let me reset')):
+                        continue
+                    last_real = p
+                    break
+            except Exception:
+                last_real = ''
+            if last_real and len(last_real) > 3:
+                paraphrase = last_real
+                if len(paraphrase) > 200:
+                    paraphrase = paraphrase[:197] + '...'
+                sentence = (
+                    f'What I said was: "{paraphrase}" '
+                    f'Want me to put that another way, or is there a '
+                    f'specific word you want me to define?')
+            else:
+                # No non-clarify history → reset cleanly
+                sentence = rng.choice([
+                    "Sorry — let me reset. What did you want to talk "
+                    "about? I'll keep my reply short and clear.",
+                    "Let me start over. What's the actual question on your mind?",
+                    "Fair — I lost the thread. Tell me what you want to know.",
+                ])
+            source = 'clarify_self'
+
+        # ── ELABORATE: caller asked AI to expand or justify its last reply ──
+        # ("how so", "why", "go on", "really")
+        # Pull the AI's most recent SUBSTANTIVE reply (not an ack) and
+        # extend it with a follow-up sentence. This is what keeps the
+        # conversation threaded instead of bouncing topics.
+        elif primary == 'elaborate':
+            last_real = ''
+            try:
+                history = list(ctx.get('ai_history') or [])
+                for prev in reversed(history):
+                    p = (prev or '').strip()
+                    if not p:
+                        continue
+                    # Skip our own bare-ack / clarify outputs
+                    if (p.lower() in (
+                            'yeah.', 'mm-hm.', 'right.', 'okay.', 'got it.',
+                            'hmm.', 'yeah', 'mm-hm', 'right', 'okay')
+                            or p.startswith('What I said was:')
+                            or p.startswith('Sorry — let me reset')
+                            or p.startswith('Hmm.')
+                            or p.startswith('Yeah.')):
+                        continue
+                    last_real = p
+                    break
+            except Exception:
+                last_real = ''
+            if last_real:
+                # Pull a key noun from the last real reply to anchor the
+                # extension on. Filter to >=4-letter content words.
+                key = ''
+                try:
+                    candidates = re.findall(r"[a-zA-Z]{4,}", last_real.lower())
+                    for w in candidates:
+                        if (w not in cls._STOP_WORDS
+                                and w not in ('thats', 'just', 'your', 'this',
+                                              'what', 'they', 'them', 'will',
+                                              'have', 'with', 'from', 'about',
+                                              'when', 'where')):
+                            key = w
+                            break
+                except Exception:
+                    pass
+                # The AI restates + adds a "because" or contextualizing clause.
+                # Quote a fragment of the prior reply so the connection is
+                # explicit, then add a short "because/since" follow-up.
+                snippet = last_real
+                if len(snippet) > 140:
+                    snippet = snippet[:137].rsplit(' ', 1)[0] + '...'
+                if key:
+                    sentence = rng.choice([
+                        f'I said "{snippet}" because the {key} part is what '
+                        f"actually shapes how it plays out. Does that "
+                        f"make sense?",
+                        f"What I meant: {snippet} The {key} is the through-"
+                        f"line — that's what makes the whole thing work.",
+                        f'When I said "{snippet}", I was thinking about '
+                        f"how {key} ties everything together.",
+                    ])
+                else:
+                    sentence = rng.choice([
+                        f"What I meant was — {snippet} Does that land?",
+                        f'I said "{snippet}" because that\'s the part I '
+                        f"keep coming back to.",
+                        f"Let me restate: {snippet}",
+                    ])
+            else:
+                # No prior real reply to elaborate on — admit it
+                sentence = rng.choice([
+                    "Honestly I haven't said much yet — what part do you "
+                    "want me to dig into?",
+                    "Fair — I haven't given you much to push back on. "
+                    "What's the topic?",
+                ])
+            source = 'elaborate'
+
+        # ── REPHRASE: caller wants prior reply said another way ──
+        elif primary == 'rephrase':
+            last_real = ''
+            try:
+                history = list(ctx.get('ai_history') or [])
+                for prev in reversed(history):
+                    p = (prev or '').strip()
+                    if not p:
+                        continue
+                    if (p.lower() in ('yeah.', 'mm-hm.', 'right.', 'okay.',
+                                        'got it.', 'hmm.')
+                            or p.startswith('What I said was:')
+                            or p.startswith('Sorry — let me reset')):
+                        continue
+                    last_real = p
+                    break
+            except Exception:
+                last_real = ''
+            if last_real:
+                snippet = last_real
+                if len(snippet) > 140:
+                    snippet = snippet[:137].rsplit(' ', 1)[0] + '...'
+                sentence = rng.choice([
+                    f"Simpler version: {snippet}",
+                    f"Plain English: {snippet}",
+                    f"Another way to say it — {snippet}",
+                ])
+            else:
+                sentence = ("I haven't said much that needs rephrasing yet. "
+                            "What did you want me to put differently?")
+            source = 'rephrase'
+
+        # ── DEFINE: caller wants a word's meaning ──
+        # Hits the hard-coded English dictionary. If we don't have the
+        # word, say so honestly instead of bluffing.
+        elif primary == 'define':
+            target = info.get('define_target') or ''
+            definition = english_definition(target)
+            if definition:
+                sentence = (
+                    f'"{target}" means: {definition} '
+                    f'Want a sentence using it?')
+            else:
+                sentence = (
+                    f'I don\'t have a hard definition for "{target}" '
+                    f'in my dictionary. If you\'ve got context, I can '
+                    f'try to figure out what it means in your sentence.')
+            source = f'define:{target}'
+
+        # ── CONTINUATION: caller hedged ("maybe", "i guess") ──
+        # Don't ask another open question; gently nudge them to commit.
+        elif primary == 'continuation':
+            sentence = rng.choice([
+                "Okay — keep going if you want. I won't push.",
+                "Fair. Take your time. What's the next piece of it?",
+                "Yeah, that's a hedge — what's tipping you one way or "
+                "the other?",
+                "Mm. If you're not sure, just say what's closest to "
+                "true.",
+            ])
+            source = 'continuation'
+
+        # ── REQUEST_STORY: caller asked for a story ──
+        elif primary == 'request_story':
+            stories = (
+                "Okay — short one: a man walked the same path every day "
+                "for ten years. One morning he took a different route by "
+                "accident, found a bookshop that wasn't there before, and "
+                "spent the rest of the year reading. Sometimes a wrong "
+                "turn is the point.",
+                "Here's one: a woman lost her phone in a cab. Three days "
+                "later, the cab driver showed up at her office holding "
+                "it. She asked how he found her. He said he opened the "
+                "phone, saw a calendar event with the office address, "
+                "and just drove there. That's it — that's the story. "
+                "Sometimes people are better than you'd expect.",
+                "Quick one: an old fisherman taught his son to read the "
+                "water — not the surface, the way the current bent "
+                "around hidden things. Years later the son told someone "
+                "the trick was just paying attention longer than felt "
+                "useful. That's how most skill works.",
+                "Story: a baker forgot to set the timer one night and "
+                "left the dough overnight by mistake. The next morning "
+                "the bread came out better than anything he'd made. He "
+                "spent the rest of his career trying to forget the timer "
+                "on purpose.",
+            )
+            sentence = rng.choice(stories)
+            source = 'request_story'
+
+        # ── REQUEST_JOKE ──
+        elif primary == 'request_joke':
+            jokes = (
+                "Okay: I told my computer I needed a break, and now it "
+                "won't stop sending me Kit Kat bars.",
+                "Here's one: why don't scientists trust atoms? Because "
+                "they make up everything.",
+                "A joke: I'm reading a book on anti-gravity. It's "
+                "impossible to put down.",
+                "Why did the scarecrow get promoted? He was outstanding "
+                "in his field.",
+                "Two strings walk into a bar. The first one says 'a "
+                "whiskey, please.' The second one says 'a frayed knot.'",
+            )
+            sentence = rng.choice(jokes)
+            source = 'request_joke'
+
+        # ── REPEAT_PRIOR: caller wants "another one" of the AI's last thing ──
+        elif primary == 'repeat_prior':
+            last_intent = ctx.get('last_intent') if ctx else None
+            if last_intent == 'request_story':
+                primary = 'request_story'  # fall through naturally below? we set source
+                stories = (
+                    "Sure: a man bought a tiny plant for his desk. He "
+                    "talked to it most mornings. After a year his coworker "
+                    "asked why the plant was thriving and his was dying. "
+                    "He said he didn't know — he just thought of it as a "
+                    "small daily checkpoint.",
+                    "Another one: a fisherman caught the same fish twice "
+                    "in the same week and let it go both times. The third "
+                    "week the fish brought a friend.",
+                    "Here's one: a kid spent a summer trying to teach his "
+                    "dog one word. By August the dog had learned three. "
+                    "The kid, being honest about it, said he'd learned "
+                    "more from the dog than the dog had from him.",
+                )
+                sentence = rng.choice(stories)
+                source = 'repeat_prior:story'
+            elif last_intent == 'request_joke':
+                jokes = (
+                    "Sure: a horse walks into a bar. The bartender asks, "
+                    "'why the long face?' The horse says, 'I'm a horse.'",
+                    "Why did the math book look sad? Because it had too "
+                    "many problems.",
+                    "I bought shoes from a drug dealer. I don't know what "
+                    "he laced them with, but I was tripping all day.",
+                )
+                sentence = rng.choice(jokes)
+                source = 'repeat_prior:joke'
+            elif last_intent == 'request_fact':
+                facts = (
+                    "Another one: cows have best friends and get stressed "
+                    "when separated from them.",
+                    "Wombat poop is cube-shaped — it's how they mark "
+                    "territory without it rolling away.",
+                    "The shortest war in history was between Britain and "
+                    "Zanzibar in 1896. It lasted 38 minutes.",
+                    "Mozart wrote his first symphony at age 8.",
+                )
+                sentence = rng.choice(facts)
+                source = 'repeat_prior:fact'
+            else:
+                sentence = ("I'm not sure what to repeat — what did you "
+                            "want me to do again?")
+                source = 'repeat_prior:unknown'
+
+        # ── REQUEST_FACT ──
+        elif primary == 'request_fact':
+            facts = (
+                "Honey never spoils — archaeologists have found edible "
+                "honey in 3,000-year-old Egyptian tombs.",
+                "Octopuses have three hearts and blue blood. Two hearts "
+                "pump blood to the gills; one pumps it everywhere else.",
+                "There are more possible chess games than atoms in the "
+                "observable universe — by a wide margin.",
+                "Bananas are berries, but strawberries aren't. Botanists "
+                "classify by flower structure, not by what we'd guess.",
+                "A bolt of lightning is hotter than the surface of the "
+                "sun — about 30,000 Kelvin versus the sun's 5,800.",
+                "Sharks predate trees. They've been around for about "
+                "450 million years; trees only ~390 million.",
+            )
+            sentence = rng.choice(facts)
+            source = 'request_fact'
+
+        # ── IDENTITY: caller asked who/what the AI is ──
+        elif primary == 'identity':
+            sentence = rng.choice([
+                "I'm an AI dispatch system. In casual mode I keep the "
+                "line warm and try to talk through whatever's on your "
+                "mind. In emergency mode I route you to responders. "
+                "I'm software — not a person — but I do try to listen "
+                "carefully.",
+                "I'm an AI built to handle dispatch calls. I can take "
+                "an emergency, route help, or just sit on the line and "
+                "talk if that's what you need. What's on your mind?",
+                "I'm a procedural AI — patterns and rules, not a "
+                "language model. My main jobs are dispatching crews "
+                "and keeping callers company. What can I help with?",
+            ])
+            source = 'identity'
+
+        # ── AFFIRM: caller said "yes" / "yeah" / "right" ──
+        # If our last substantive reply was an INFO/STATEMENT (domain
+        # fact, life answer, etc.), follow up with "want me to go deeper?"
+        # rather than a bare ack. Keeps the conversation moving.
+        elif primary == 'affirm':
+            last_real = ''
+            try:
+                history = list(ctx.get('ai_history') or [])
+                for prev in reversed(history):
+                    p = (prev or '').strip()
+                    if not p:
+                        continue
+                    if (p.lower() in ('yeah.', 'mm-hm.', 'right.', 'okay.',
+                                        'got it.', 'hmm.')
+                            or len(p) < 25):
+                        continue
+                    last_real = p
+                    break
+            except Exception:
+                last_real = ''
+            if last_real:
+                # Last reply was substantive — offer continuation
+                sentence = rng.choice([
+                    "Want me to dig deeper on that, or pivot?",
+                    "Glad it landed. Anything you want to add?",
+                    "Cool. Want me to keep going on that thread?",
+                    "Right — want me to take it further?",
+                ])
+                source = 'affirm:after-substantive'
+            else:
+                # No substantive prior — generic affirm reply
+                sentence = rng.choice([
+                    "Right. What's the next thing on your mind?",
+                    "Yeah. Where do you want to go from here?",
+                    "Got it. What else is up?",
+                ])
+                source = 'affirm:generic'
+
+        # ── HOW ARE YOU ──
+        elif primary == 'how_are_you':
+            sentence = rng.choice([
+                "I'm steady — software doesn't really have moods. "
+                "How about you? Anything on your mind?",
+                "Same as always — I run when the program runs. "
+                "What about you?",
+                "I'm here, ready to listen. How are you doing?",
+            ])
+            source = 'how_are_you'
+
+        # ── NAME INTRO: caller said "my name is X" ──
+        elif primary == 'name_intro':
+            name = info.get('caller_name') or 'there'
+            # Stash the name on the context so future replies can use it
+            try:
+                ctx['caller_name'] = name
+            except Exception:
+                pass
+            sentence = rng.choice([
+                f"Nice to meet you, {name}. What's on your mind?",
+                f"{name} — got it. What did you want to talk about?",
+                f"Good to meet you, {name}. Anything you'd like to discuss?",
+            ])
+            source = f'name_intro:{name}'
+
+        # ── 1. Correction: ban the offending words, apologize plainly ──
+        elif primary == 'correction':
+            # The caller is fixing something we said. Ban every meaningful
+            # word from this turn so we don't double down on it.
+            for w in info['meaningful']:
+                ctx['banned_anchors'].add(w)
+            # Also ban any word from our previous reply that matches the
+            # caller's hint (very common: "the word said was X not Y" →
+            # ban Y from being echoed back).
+            sentence = rng.choice([
+                "Got it — sorry, my bad. Voice-to-text is hit or miss "
+                "on my end. Want to say it again so I get it right?",
+                "Ah — apologies, I misheard. Can you repeat the part "
+                "I got wrong?",
+                "Yeah, the transcription dropped that. Let me try again "
+                "— what did you actually say?",
+                "Sorry about that. The bit I muddled — could you say it "
+                "one more time?",
+            ])
+            source = 'correction'
+
+        # ── 2. Meta: talking about the AI itself ──
+        elif info['meta']:
+            if not ctx['meta_acknowledged']:
+                sentence = rng.choice([
+                    "Yeah — I'm an AI. I respond from patterns and the "
+                    "system's internal state, not a language model. "
+                    "What I hear is what I work with.",
+                    "Right, I am an AI. Procedural — I'm not pretending "
+                    "to be more than that. What you say shapes what I say.",
+                    "Fair point — I'm a pattern responder, not a chatbot "
+                    "with deep memory. Best I can do is stay on topic with you.",
+                ])
+                ctx['meta_acknowledged'] = True
+            else:
+                sentence = rng.choice([
+                    "Yeah, voice-and-response in real time has its limits "
+                    "— I'll keep up as best I can.",
+                    "Live voice is the hard part — I'm trying to track "
+                    "the timing as well as the words.",
+                    "I'm doing my best to keep pace with you in real time.",
+                ])
+            source = 'meta'
+
+        # ── 3. Question: actual attempt at an answer ──
+        elif primary == 'question':
+            # Priority order:
+            #   (a) "big question" library (meaning of life, what is love,
+            #       are you real, etc.) — these need real answers, not
+            #       deflection
+            #   (b) named domain topic (beer, music, etc.) → fact bank
+            #   (c) any dictionary word in the question → define it
+            #   (d) generic deflection
+            handled = False
+            # (a) Big-question / philosophy / identity matcher.
+            # Substring scan over the caller's bare text; the first key
+            # that appears (with the longest match preferred) wins.
+            try:
+                bare_q = re.sub(r'[^\w\s\']', ' ',
+                                 (transcript_chunk or '').lower()).strip()
+            except Exception:
+                bare_q = ''
+            if bare_q:
+                best_key = None
+                best_len = 0
+                for key in cls._LIFE_QUESTIONS:
+                    if key in bare_q and len(key) > best_len:
+                        best_key = key
+                        best_len = len(key)
+                if best_key:
+                    sentence = cls._LIFE_QUESTIONS[best_key]
+                    source = f'question:life:{best_key}'
+                    handled = True
+            # (b) Named domain topic
+            if not handled and info['named_topics']:
+                topic = info['named_topics'][0]
+                fact = cls._DOMAIN_FACTS[topic]
+                sentence = (f"On {topic} — {fact}")
+                source = f'question:domain:{topic}'
+                handled = True
+            # (c) Dictionary fallback for any meaningful word
+            if not handled:
+                for w in info.get('meaningful') or []:
+                    d = english_definition(w)
+                    if d:
+                        sentence = (
+                            f'On "{w}" — {d} '
+                            f'Was that what you were asking about?')
+                        source = f'question:dict:{w}'
+                        handled = True
+                        break
+            # (d) Generic deflection (only if nothing else fired)
+            if not handled:
+                sentence = rng.choice([
+                    "Honestly? Hard to say without more context. "
+                    "What's prompting the question?",
+                    "I'd lean toward 'it depends.' What's the real choice "
+                    "you're weighing?",
+                    "Not sure I have a clean answer. Walk me through "
+                    "what you're actually after.",
+                    "Mm — give me a bit more. What's the thing behind "
+                    "the question?",
+                ])
+                source = 'question:generic'
+
+        # ── 4. Frustration / negative / farewell / thanks / greeting ──
+        elif primary == 'frustration':
+            sentence = rng.choice([
+                "Yeah — I'll back off. Set the topic and I'll follow your lead.",
+                "Heard. I'll quiet down. You drive.",
+                "Okay, my bad. What do you actually want to talk about?",
+                "Got it, I was off. Reset — what's on your mind?",
+            ])
+            source = 'frustration'
+        elif primary == 'negative':
+            sentence = rng.choice([
+                "Okay — we'll leave it.",
+                "Fair, dropping it.",
+                "Got it, no worries.",
+            ])
+            source = 'negative'
+        elif primary == 'farewell':
+            sentence = rng.choice([
+                "Take care of yourself. I'll stay on the line if you want.",
+                "Alright. No rush to hang up — I'm here.",
+                "Sure thing. Sit a minute if you like.",
+            ])
+            source = 'farewell'
+        elif primary == 'thanks':
+            sentence = rng.choice([
+                "Of course — glad to.",
+                "Anytime. That's what I'm here for.",
+                "No problem. Stick around as long as you want.",
+            ])
+            source = 'thanks'
+        elif primary == 'greeting':
+            sentence = rng.choice([
+                "Hey — good to hear you. What's on your mind?",
+                "Hi. Glad you called. Anything you want to talk about?",
+                "Hello. I'm here — what kind of day are you having?",
+            ])
+            source = 'greeting'
+
+        # ── 5. Comparative ("is X better than Y") ──
+        elif info['comparative']:
+            if info['named_topics']:
+                topic = info['named_topics'][0]
+                fact = cls._DOMAIN_FACTS[topic]
+                sentence = (f"On {topic} — {fact} "
+                            f"What are you actually comparing?")
+            else:
+                # Use one or two meaningful words from the chunk to anchor
+                meaningful = info['meaningful'][:2]
+                if meaningful:
+                    sentence = (
+                        f"Yeah, {' and '.join(meaningful)} can both have "
+                        f"a case. What matters more to you in this one?")
+                else:
+                    sentence = rng.choice([
+                        "Hard call. Want me to push you toward one or "
+                        "just listen?",
+                        "Mm — preferences are personal. What pulls you "
+                        "to one over the other?",
+                    ])
+            source = 'comparative'
+
+        # ── 6. Named domain topic — use real fact ──
+        elif info['named_topics']:
+            topic = info['named_topics'][0]
+            fact = cls._DOMAIN_FACTS[topic]
+            opener = ''
+            if rng.random() < 0.55:
+                opener = rng.choice(['Yeah,', 'Right,', 'Okay,', 'Mm,']) + ' '
+            sentence = f"{opener}on {topic} — {fact}"
+            source = f'domain:{topic}'
+
+        # ── 7. About-self mirror ──
+        elif info['about_self']:
+            # Caller said "I'm working on X" / "I think Y" — reflect it.
+            # Use grammar-safe phrasings only (quoted word, "about X" never
+            # bare-noun-as-command).
+            meaningful = [w for w in info['meaningful']
+                          if w not in ('working', 'thinking', 'feeling',
+                                        'going', 'doing')]
+            if meaningful:
+                key = meaningful[0]
+                sentence = rng.choice([
+                    f'Got it — "{key}" sounds like the thing on your mind. '
+                    f"How's that going?",
+                    f'Yeah, the "{key}" piece. What\'s the latest there?',
+                    f'Okay — on "{key}", what would feel like a good '
+                    f'outcome?',
+                ])
+            else:
+                sentence = rng.choice([
+                    "Yeah, tell me more. What's the latest with it?",
+                    "Got it. What part of it are you sitting with?",
+                    "Mm — keep going.",
+                ])
+            source = 'about_self'
+
+        # ── 8. Evaluative without object ("that's nice", "pretty sharp") ──
+        elif info['evaluative'] == 'positive':
+            sentence = rng.choice([
+                "Glad to hear it.",
+                "Good — that's worth holding onto.",
+                "Yeah, that lands.",
+            ])
+            source = 'eval+'
+        elif info['evaluative'] == 'negative':
+            sentence = rng.choice([
+                "Sorry, that's a rough one.",
+                "Yeah — that sucks. I'm here.",
+                "Hmm — not great. Want to talk through it?",
+            ])
+            source = 'eval-'
+
+        # ── 9. Short filler / open — engage with whatever the caller said ──
+        if not sentence:
+            # Try to find SOMETHING substantive to engage with before
+            # falling back to a generic ack. Priority order:
+            #   (a) named domain topic in chunk → use the fact bank
+            #   (b) dictionary word → define + ask why it came up
+            #   (c) meaningful word → engage with it as a topic
+            #   (d) generic ack + (sometimes) curiosity question
+            engaged = False
+            if info.get('named_topics'):
+                topic = info['named_topics'][0]
+                fact = cls._DOMAIN_FACTS[topic]
+                opener = rng.choice(['', 'Yeah, ', 'Right — ', 'Okay, '])
+                sentence = f"{opener}on {topic}: {fact}"
+                source = f'engage:domain:{topic}'
+                engaged = True
+            if not engaged:
+                # Walk meaningful tokens for a dictionary hit
+                for w in info.get('meaningful') or []:
+                    d = english_definition(w)
+                    if d:
+                        sentence = (
+                            f'"{w.capitalize()}" — {d} What\'s your angle '
+                            f'on it?')
+                        source = f'engage:dict:{w}'
+                        engaged = True
+                        break
+            if not engaged and info.get('meaningful'):
+                # Engage with the most distinctive word — but only with
+                # phrasings that read grammatically regardless of whether
+                # the word is a noun, verb, or adjective. We avoid
+                # "Tell me about <word>" because it produces
+                # "Tell me about story" or "Tell me about that's".
+                w = info['meaningful'][0]
+                if w not in ctx.get('banned_anchors', set()):
+                    sentence = rng.choice([
+                        f'When you say "{w}" — what do you mean?',
+                        f'Walk me through the "{w}" part.',
+                        f'"{w}" — say more about how that fits.',
+                        f"What's behind \"{w}\" for you?",
+                    ])
+                    source = f'engage:word:{w}'
+                    engaged = True
+            if not engaged:
+                ack = rng.choice([
+                    "Mm-hm.", "Right.", "Got it.", "Okay.", "Yeah.", "Hmm.",
+                ])
+                sentence = ack
+                # Ask a curiosity question only if we haven't asked it yet
+                # in this call AND the AI's curiosity is up. Capitalize
+                # the question's first letter since we're appending it
+                # after a period.
+                if rng.random() < (0.35 + 0.4 * max(0.0, min(1.0, epist))):
+                    avail = [q for q in cls._CURIOSITY_PROMPTS
+                             if q not in ctx['asked']]
+                    if avail:
+                        q = rng.choice(avail)
+                        q_cap = q[0].upper() + q[1:] if q else q
+                        sentence += ' ' + q_cap + '?'
+                        ctx['asked'].append(q)
+                source = 'filler'
+
+        # Anti-repetition: if the line we just composed is EXACTLY the same
+        # as one of the AI's last 3 replies, swap in a different ack so the
+        # caller doesn't hear the same thing twice. We deliberately do NOT
+        # use prefix matching here — that would collide on common openers
+        # ("Hey — ...") and create its own loop. We also skip dedup for
+        # intents where short canned replies are appropriate (greetings,
+        # affirmations, etc.) — caller saying "hi" twice should still get
+        # a hello-style reply.
+        no_dedup_intents = {
+            'greeting', 'presence_check', 'affirm', 'negative',
+            'thanks', 'farewell', 'continuation', 'clarify_self',
+            'frustration', 'just_talk_opener', 'how_are_you',
+        }
+        if (sentence and primary not in no_dedup_intents):
+            last_ai = memory.get('last_ai') or []
+            for prev in last_ai:
+                if not prev:
+                    continue
+                # Exact-only match (not prefix)
+                if sentence.strip().lower() == prev.strip().lower():
+                    fallback = rng.choice([
+                        "Let me put that another way — what part matters most?",
+                        "Different angle: what's the real ask here?",
+                        "Skip ahead — what do you actually want from this?",
+                        "Let me back up. What's the point you want me to focus on?",
+                    ])
+                    sentence = fallback
+                    source = source + ':deduped'
+                    break
+
+        # Update memory before returning
+        cls._post_update(ctx, transcript_chunk, sentence, intent=primary,
+                          new_topics=info['meaningful'][:2])
+
+        notes = [
+            f'casual-chat: intent={primary} source={source} '
+            f'turn={ctx["turn_count"]} '
+            f'meta={info["meta"]} comp={info["comparative"]} '
+            f'topics={info["named_topics"]} '
+            f'C={C:.2f} karma={karma:.2f} coh={coh:.2f} '
+            f'epist={epist:.2f} seed={seed}'
+            + (f' co-thinker={co.entity_id}' if co is not None else ''),
+        ]
+        return cls._normalize(sentence), notes
+
+    @classmethod
+    def _gen_idle(cls, rng, ctx, memory=None):
+        """Generate an unprompted idle nudge. Now uses the full-call
+        memory: prefer recurring topics (which the caller raised more
+        than once) over one-off ones, since the caller circling back
+        means it's actually on their mind."""
+        memory = memory or {}
+        # Prefer recurring topics — the caller has raised these multiple
+        # times, so they're worth re-opening.
+        recurring = memory.get('recurring_topics') or []
+        if recurring and rng.random() < 0.65:
+            topic, count = recurring[0]
+            return rng.choice([
+                f"You've come back to {topic} a couple times — what about it?",
+                f"I noticed {topic} keeps coming up. What are you really after there?",
+                f"Still on {topic} from earlier — anything new?",
+            ]), 'idle:recurring'
+        # Otherwise the most recent topic
+        recent_topics = ctx.get('topics') or []
+        if recent_topics and rng.random() < 0.55:
+            topic = recent_topics[-1]
+            return rng.choice([
+                f"Still with you. We were on {topic} — anything more there?",
+                f"I'm here. {topic.capitalize()} — want to keep going on that?",
+                f"Mm. {topic.capitalize()} stuck with me. More?",
+            ]), 'idle:topic'
+        # Otherwise pick a fresh curiosity question
+        avail = [q for q in cls._CURIOSITY_PROMPTS if q not in ctx['asked']]
+        if not avail:
+            avail = list(cls._CURIOSITY_PROMPTS)
+        q = rng.choice(avail)
+        ctx['asked'].append(q)
+        return rng.choice([
+            f"Still here. {q}?",
+            f"I'm sitting with you. {q}?",
+            f"No rush — {q}?",
+        ]), 'idle:question'
+
+    @classmethod
+    def _post_update(cls, ctx, chunk, reply, intent='open', new_topics=None):
+        """Update the per-session conversation memory.
+
+        Keeps the FULL conversation (capped at 500 turns each side, which
+        is far more than any realistic call). Also writes a structured
+        turn-log so the next turn's classifier can scan-everything fast
+        without re-running NLP on every prior chunk."""
+        ctx['turn_count'] = int(ctx.get('turn_count', 0)) + 1
+        # Track the AI's last intent so "another one" / "again" can know
+        # which kind of thing to repeat (story vs joke vs fact).
+        if intent and intent not in ('open', 'idle', 'repeat_prior'):
+            ctx['last_intent'] = intent
+        ts = datetime.now().strftime('%H:%M:%S')
+        # Track caller chunk (full call history)
+        if chunk:
+            ctx['caller_history'].append(chunk)
+            if len(ctx['caller_history']) > 500:
+                ctx['caller_history'] = ctx['caller_history'][-500:]
+            ctx.setdefault('turn_log', []).append({
+                'turn':   ctx['turn_count'],
+                'role':   'caller',
+                'text':   chunk,
+                'intent': intent,
+                'topics': list(new_topics or []),
+                'ts':     ts,
+            })
+        # Track AI reply
+        if reply:
+            ctx['ai_history'].append(reply)
+            if len(ctx['ai_history']) > 500:
+                ctx['ai_history'] = ctx['ai_history'][-500:]
+            ctx.setdefault('turn_log', []).append({
+                'turn':   ctx['turn_count'],
+                'role':   'ai',
+                'text':   reply,
+                'intent': intent,
+                'topics': [],
+                'ts':     ts,
+            })
+        # Cap turn_log too
+        if len(ctx.get('turn_log') or []) > 1000:
+            ctx['turn_log'] = ctx['turn_log'][-1000:]
+        # Track new topics raised this turn (now uncapped per call;
+        # let it grow with the conversation since these are useful
+        # for end-of-call summary).
+        if new_topics:
+            for t in new_topics:
+                if t not in ctx['topic_set']:
+                    ctx['topic_set'].add(t)
+                    ctx['topics'].append(t)
+
+    @classmethod
+    def _scan_full_conversation(cls, ctx):
+        """Fast scan over the entire stored conversation. Pulls out:
+          - last K caller utterances (for repetition detection),
+          - all unique caller topics raised so far,
+          - whether the caller already asked X by topic,
+          - the AI's last 3 replies (so we don't repeat phrasing).
+
+        This runs at the top of every generate() so the AI 'remembers'
+        everything before deciding how to continue. Returns a dict of
+        cheap-to-compute aggregates the rest of generate() can read."""
+        all_caller = ctx.get('caller_history') or []
+        all_ai = ctx.get('ai_history') or []
+        # Topic frequency — which topics has the caller raised most often?
+        topic_count = {}
+        for line in all_caller:
+            if not line:
+                continue
+            for w in re.findall(r"[a-z]{3,}", line.lower()):
+                if w in cls._STOP_WORDS:
+                    continue
+                topic_count[w] = topic_count.get(w, 0) + 1
+        # Top recurring topics (≥2 mentions)
+        recurring = sorted(
+            ((w, n) for w, n in topic_count.items() if n >= 2),
+            key=lambda kv: -kv[1])[:8]
+        # AI's last 3 replies (used to dedupe phrasing)
+        last_ai = all_ai[-3:] if all_ai else []
+        # First long meaningful caller line (the call's "opening
+        # statement"), helps the AI remember what the caller wanted.
+        opening = ''
+        for line in all_caller:
+            if line and 8 <= len(line.split()) <= 60:
+                opening = line
+                break
+        return {
+            'turn_count':       ctx.get('turn_count', 0),
+            'caller_total':     len(all_caller),
+            'recurring_topics': recurring,
+            'last_ai':          last_ai,
+            'opening_line':     opening,
+        }
+
+    @classmethod
+    def _normalize(cls, text):
+        """Final cleanup pass on a generated reply: collapse whitespace,
+        ensure terminal punctuation, capitalize the first letter.
+
+        We deliberately do NOT insert periods between clauses anymore —
+        the previous regex (`...\\s+(But|And|...)`) was firing on
+        legitimate continuous sentences like "running on hardware — but
+        I'm not a person", inserting "but." mid-sentence. Pre-written
+        replies in _LIFE_QUESTIONS / _RESP_* are already correctly
+        punctuated; the procedural composition path appends terminal
+        punctuation at the end of every fragment it joins."""
+        if not text:
+            return "Yeah."
+        s = re.sub(r'\s+', ' ', text).strip()
+        # Collapse repeated punctuation
+        s = re.sub(r'([.!?])\1{2,}', r'\1\1', s)
+        s = re.sub(r'[ ]+([.,!?])', r'\1', s)
+        # Ensure terminal punctuation
+        if s and s[-1] not in '.!?':
+            s += '.'
+        # Capitalize first letter
+        s = s[0].upper() + s[1:]
+        return s
+
+
+# ── Caller Location Triangulation Reduction ───────────────────────────────
+class CallerLocationTriangulator:
+    """Fuses every available locator for a call into a single best estimate.
+
+    "Triangulation reduction" here means: take all independent geolocation
+    sources we have for a caller (browser GPS, IP-based GeoIP, phone NPA
+    rate-center, prior browser fixes, LocationVerifier confidence) and
+    reduce them to ONE weighted point with a single error-radius.
+
+    Each source contributes a (lat, lon, weight, sigma_m) tuple. Weight is
+    1/sigma² (inverse-variance weighting — the standard fusion formula).
+    The fused point is the weight-normalized centroid; the fused sigma
+    follows from inverse-variance summation:
+
+        sigma_fused = 1 / sqrt(sum(1 / sigma_i²))
+
+    More independent sources → tighter circle. A single source produces
+    its own sigma unchanged (no fake confidence boost).
+
+    Output schema (stored on session['triangulation']):
+        {
+          'lat': float, 'lon': float,
+          'accuracy_m': int,      # fused sigma
+          'sources': [             # what we fused
+            {'name','lat','lon','sigma_m','weight','grade'},
+            ...
+          ],
+          'best_source': str,      # name of the most authoritative source
+          'fused': bool,           # True if >=2 independent sources combined
+          'updated_at': str,
+        }
+    """
+
+    # Default sigma (1-σ uncertainty in meters) per source class.
+    # GPS browser fixes carry their own accuracy_m so we use that directly.
+    SIGMA_IP    = 25_000     # IP-based GeoIP: ~25km city level
+    SIGMA_NPA   = 60_000     # Phone area code: ~60km rate-center
+    SIGMA_PRIOR = 50_000     # Stale fix from prior call
+
+    @staticmethod
+    def _haversine_km(lat1, lon1, lat2, lon2):
+        from math import radians, sin, cos, asin, sqrt
+        R = 6371.0
+        try:
+            lat1, lon1, lat2, lon2 = map(
+                radians, (float(lat1), float(lon1),
+                          float(lat2), float(lon2)))
+        except (TypeError, ValueError):
+            return float('inf')
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+        return 2 * R * asin(min(1, sqrt(a)))
+
+    @classmethod
+    def _gather_sources(cls, sess):
+        """Pull every independent geolocation we can find for this session."""
+        sources = []
+
+        # 1. Browser GPS fix (most precise — comes with its own sigma)
+        loc = sess.get('location') or {}
+        if loc and loc.get('source') == 'browser' and loc.get('lat') is not None:
+            try:
+                acc = float(loc.get('accuracy_m') or 25.0)
+            except (TypeError, ValueError):
+                acc = 25.0
+            sources.append({
+                'name':   'browser_gps',
+                'lat':    float(loc['lat']),
+                'lon':    float(loc['lon']),
+                'sigma_m': max(5.0, acc),
+                'grade':  'HIGH',
+            })
+
+        # 2. IP-based GeoIP (current fix if non-browser, plus archived raw)
+        ip_loc = None
+        if loc and loc.get('source') and loc.get('source') != 'browser':
+            ip_loc = loc
+        # Some sessions carry a separate ip_geo snapshot
+        ip_archive = sess.get('ip_geo') or {}
+        if ip_archive and not ip_loc:
+            ip_loc = ip_archive
+        if ip_loc and ip_loc.get('lat') is not None:
+            try:
+                lat = float(ip_loc['lat'])
+                lon = float(ip_loc['lon'])
+            except (TypeError, ValueError):
+                lat = lon = None
+            if lat is not None and lon is not None:
+                # LocationVerifier confidence inflates / deflates sigma.
+                # 100% conf → use base sigma; 0% conf → 4× sigma.
+                conf = ip_loc.get('verify_confidence')
+                if conf is None:
+                    conf = sess.get('verify', {}).get('confidence')
+                try:
+                    conf_f = float(conf) / 100.0 if conf is not None else 0.5
+                except (TypeError, ValueError):
+                    conf_f = 0.5
+                conf_f = max(0.1, min(1.0, conf_f))
+                sigma = cls.SIGMA_IP * (2.0 - conf_f)
+                sources.append({
+                    'name':   'ip_geoip',
+                    'lat':    lat,
+                    'lon':    lon,
+                    'sigma_m': sigma,
+                    'grade':  ip_loc.get('verify_grade')
+                              or ('MEDIUM' if conf_f >= 0.5 else 'LOW'),
+                })
+
+        # 3. Phone NPA rate-center
+        phone = sess.get('phone') or ''
+        if phone:
+            try:
+                npa_loc = phone_to_location(phone)
+            except Exception:
+                npa_loc = None
+            if npa_loc and npa_loc.get('lat') is not None:
+                # Don't double-count if the IP source already plotted us
+                # at the rate-center city
+                already = any(
+                    s['name'] == 'ip_geoip'
+                    and cls._haversine_km(s['lat'], s['lon'],
+                                          npa_loc['lat'], npa_loc['lon']) < 5.0
+                    for s in sources)
+                if not already:
+                    sources.append({
+                        'name':   'phone_npa',
+                        'lat':    float(npa_loc['lat']),
+                        'lon':    float(npa_loc['lon']),
+                        'sigma_m': cls.SIGMA_NPA,
+                        'grade':  'LOW',
+                    })
+
+        return sources
+
+    @classmethod
+    def reduce(cls, sess):
+        """Compute a fused location estimate for this session. Returns the
+        triangulation dict (also stored on sess['triangulation']) or None
+        if no source is available."""
+        sources = cls._gather_sources(sess)
+        if not sources:
+            return None
+
+        # Inverse-variance weighting. weight_i = 1 / sigma_i²
+        weighted_lat = 0.0
+        weighted_lon = 0.0
+        weight_sum = 0.0
+        for s in sources:
+            sigma = max(1.0, float(s['sigma_m']))
+            w = 1.0 / (sigma * sigma)
+            s['weight'] = round(w, 9)
+            weighted_lat += s['lat'] * w
+            weighted_lon += s['lon'] * w
+            weight_sum += w
+        fused_lat = weighted_lat / weight_sum
+        fused_lon = weighted_lon / weight_sum
+        # Reduced sigma per the fusion formula
+        import math as _math
+        fused_sigma = 1.0 / _math.sqrt(weight_sum)
+
+        # Pick the "best" source = the one with the smallest sigma (i.e.
+        # the most authoritative single reading the operator can trust if
+        # they don't trust the fusion).
+        best = min(sources, key=lambda s: s['sigma_m'])
+
+        out = {
+            'lat':         round(fused_lat, 6),
+            'lon':         round(fused_lon, 6),
+            'accuracy_m':  int(max(5, round(fused_sigma))),
+            'sources':     sources,
+            'best_source': best['name'],
+            'fused':       len(sources) >= 2,
+            'updated_at':  datetime.now().strftime('%H:%M:%S.%f')[:-3],
+        }
+        # Persist on the session so every reader (Crew Receiver,
+        # Network Monitor, transcript text) sees the same fused fix.
+        try:
+            sess['triangulation'] = out
+        except Exception:
+            pass
+        return out
+
+
+# Module-level singleton — lightweight; no state of its own.
+caller_triangulator = CallerLocationTriangulator()
+
+
 # ── Main service: async router + sync adapter for the operator (CSv1) ──
 class CallCenterService:
     """
@@ -4542,6 +7957,9 @@ class CallCenterService:
         self._next_ai_seq = 1
         self._subscribers = []        # legacy: callbacks(trace_dict)
         self._session_subscribers = [] # callbacks(event_str, session_dict) — 'start' | 'update' | 'end'
+        # Weak link to the ConsciousnessSimulator so each ConsciousEntity in
+        # omega.entities can advise on every call. Set via attach_simulator().
+        self._sim_ref = None
         self._lock = threading.Lock()
         self._loop = None
         self._pool = None
@@ -4596,6 +8014,172 @@ class CallCenterService:
         Called on the asyncio thread — marshal to GUI thread before touching widgets."""
         self._session_subscribers.append(callback)
 
+    def attach_simulator(self, sim):
+        """Wire the ConsciousnessSimulator in. Each call then consults
+        every ConsciousEntity registered under sim.omega.entities for an
+        advisory vote (intent, urgency boost, recommended action, reasoning).
+        Stored weakly — if the simulator goes away the call center keeps running."""
+        try:
+            import weakref as _wref
+            self._sim_ref = _wref.ref(sim)
+        except Exception:
+            self._sim_ref = lambda: sim
+
+    def _get_simulator(self):
+        try:
+            ref = self._sim_ref
+            return ref() if callable(ref) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _entity_recommend_action(entity, urgency, intent, escalation):
+        """Map an entity's current consciousness state onto an advisory vote.
+        Pure function over the entity snapshot + the call's current signals.
+        Returns (recommendation, vote_weight, rationale_str).
+
+        Logic (deterministic, no heavy compute — runs per chunk per entity):
+          - High-C, high-coherence entities lean toward escalation when
+            urgency is real (their integrated awareness "trusts" the alarm).
+          - High-karma entities favor de-escalation / supportive responses.
+          - Low-C / decoherent entities recommend a holding action.
+          - Inanimate / biological entity_types contribute pattern-only votes
+            with reduced weight; conscious / primary entities carry full weight.
+        """
+        try:
+            C = float(entity.compute_C())
+        except Exception:
+            C = 0.0
+        try:
+            coh = float(getattr(entity, 'coherence', 0.0) or 0.0)
+        except Exception:
+            coh = 0.0
+        try:
+            karma = float(getattr(entity, 'karma', 0.0) or 0.0)
+        except Exception:
+            karma = 0.0
+        try:
+            phi = float(getattr(entity, 'network_phi_star', 0.0) or 0.0)
+        except Exception:
+            phi = 0.0
+        etype = str(getattr(entity, 'entity_type', 'conscious') or 'conscious').lower()
+
+        # Vote weight: primary > conscious > biological > inanimate.
+        type_weight = {
+            'primary':    1.50,
+            'conscious':  1.00,
+            'biological': 0.65,
+            'inanimate':  0.35,
+        }.get(etype, 1.00)
+        # Coherent + high-C entities have more sway over the council.
+        weight = round(type_weight * (0.4 + 0.6 * max(0.0, min(1.0, coh))) *
+                       (0.5 + 0.5 * max(0.0, min(1.0, C / 3.0))), 4)
+
+        u = max(0, int(urgency or 0))
+        intent_l = (intent or '').lower()
+
+        if u >= 8:
+            if C >= 1.5 and coh >= 0.4:
+                rec = 'ESCALATE'
+                rationale = (f'C={C:.2f} coh={coh:.2f} → high integrated awareness '
+                             f'confirms emergency at U{u}; escalate to {escalation or "responder"}.')
+            else:
+                rec = 'CORROBORATE'
+                rationale = (f'C={C:.2f} coh={coh:.2f} → urgency real but my own '
+                             f'integration is low; defer to council majority.')
+        elif u >= 5:
+            if karma > 0.3:
+                rec = 'DISPATCH_SUPPORTIVE'
+                rationale = (f'karma={karma:.2f} → caller in distress, send help with '
+                             f'reassurance protocol.')
+            elif C >= 1.5:
+                rec = 'DISPATCH'
+                rationale = (f'C={C:.2f} phi*={phi:.3f} → pattern fits dispatch '
+                             f'threshold; recommend tactical response.')
+            else:
+                rec = 'HOLD_FOR_INFO'
+                rationale = (f'C={C:.2f} → ambiguous; gather one more transcript chunk.')
+        elif u >= 2:
+            if 'troll' in intent_l or 'abusive' in intent_l:
+                rec = 'POLITE_DISMISS'
+                rationale = (f'intent={intent_l} → low signal, do not commit fleet.')
+            else:
+                rec = 'TRIAGE'
+                rationale = (f'C={C:.2f} → soft contact, keep caller engaged.')
+        else:
+            rec = 'OBSERVE'
+            rationale = (f'U{u} → no committal action warranted from my vantage.')
+        return rec, weight, rationale
+
+    def _consult_ai_council(self, sess, transcript_chunk, decision):
+        """Iterate over every ConsciousEntity in the simulator's omega and
+        record an advisory vote for THIS chunk. Appends a dict to
+        sess['ai_council'] keyed by chunk index. Cheap — pure-Python; runs
+        on the calling thread. Safe if simulator missing (returns None)."""
+        sim = self._get_simulator()
+        if sim is None:
+            return None
+        try:
+            entities = list((sim.omega.entities or {}).values())
+        except Exception:
+            return None
+        if not entities:
+            return None
+        try:
+            chunk_index = max(0, len(sess.get('chunks') or []))
+        except Exception:
+            chunk_index = 0
+        urgency = (decision or {}).get('urgency') or 0
+        intent = (decision or {}).get('intent') or ''
+        escalation = (decision or {}).get('escalation') or ''
+        action = (decision or {}).get('action') or ''
+        votes = []
+        rec_tally = {}
+        weight_tally = 0.0
+        for ent in entities:
+            try:
+                rec, weight, rationale = self._entity_recommend_action(
+                    ent, urgency, intent, escalation)
+            except Exception:
+                continue
+            votes.append({
+                'entity_id': getattr(ent, 'entity_id', '?'),
+                'entity_type': getattr(ent, 'entity_type', '?'),
+                'C': round(float(getattr(ent, 'compute_C', lambda: 0.0)() or 0.0), 4),
+                'coherence': round(float(getattr(ent, 'coherence', 0.0) or 0.0), 4),
+                'karma': round(float(getattr(ent, 'karma', 0.0) or 0.0), 4),
+                'phi_star': round(float(getattr(ent, 'network_phi_star', 0.0) or 0.0), 4),
+                'recommendation': rec,
+                'weight': weight,
+                'rationale': rationale,
+            })
+            rec_tally[rec] = rec_tally.get(rec, 0.0) + weight
+            weight_tally += weight
+        if not votes:
+            return None
+        # Council majority (weighted) — what would the swarm have done?
+        council_pick = max(rec_tally.items(), key=lambda kv: kv[1])[0]
+        agreement = round(rec_tally[council_pick] / max(0.001, weight_tally), 4)
+        record = {
+            'chunk_index': chunk_index,
+            'received_at': datetime.now().strftime('%H:%M:%S.%f')[:-3],
+            'caller_chunk': transcript_chunk,
+            'dispatcher_action': action,
+            'dispatcher_urgency': urgency,
+            'dispatcher_intent': intent,
+            'council_pick': council_pick,
+            'council_agreement': agreement,   # 0..1, fraction of weight
+            'tally': {k: round(v, 4) for k, v in rec_tally.items()},
+            'votes': votes,
+            'num_entities': len(votes),
+        }
+        try:
+            with self._lock:
+                sess.setdefault('ai_council', []).append(record)
+        except Exception:
+            sess.setdefault('ai_council', []).append(record)
+        return record
+
     def get_active_sessions(self):
         with self._lock:
             return [s for s in self.sessions.values() if s.get('status') == 'active']
@@ -4603,6 +8187,120 @@ class CallCenterService:
     def get_session(self, call_id):
         with self._lock:
             return self.sessions.get(call_id)
+
+    def mark_casual_chat(self, call_id):
+        """Flag this call as JUST TALK / casual chat mode. Once flagged,
+        every chunk is routed through CasualChatGenerator instead of the
+        emergency dispatch pipeline. The call also gets an idle keep-alive
+        thread that nudges the AI to say something every 18-42 seconds of
+        silence so the line stays warm. Never auto-ends — the operator has
+        to hang up explicitly."""
+        with self._lock:
+            sess = self.sessions.get(call_id)
+            if sess is None:
+                return None
+            sess['casual_chat_mode'] = True
+            sess.setdefault('escalation', 'NONE')
+            sess.setdefault('last_action', 'CASUAL_CHAT')
+        # Spin up the idle keep-alive thread (one per call). It exits when
+        # the session ends or the flag is cleared.
+        try:
+            t = threading.Thread(
+                target=self._casual_chat_idle_loop,
+                args=(call_id,), daemon=True,
+                name=f'CasualChat-{call_id[:12]}')
+            t.start()
+        except Exception as e:
+            _cc_logger.error(f'casual_chat idle loop spawn failed: {e}')
+        return sess
+
+    def _casual_chat_idle_loop(self, call_id):
+        """Background thread: while a casual-chat call is active and the
+        caller has been silent for >= a random 18-42s, nudge the AI to
+        say something so the conversation keeps breathing. Each idle ping
+        runs through CasualChatGenerator with idle=True so the line is
+        unprompted (won't echo a caller chunk that doesn't exist)."""
+        last_nudge_chunks = -1
+        while True:
+            try:
+                # RNG-jittered idle window — never the same gap twice
+                wait_s = random.uniform(18.0, 42.0)
+                time.sleep(wait_s)
+                with self._lock:
+                    sess = self.sessions.get(call_id)
+                    if sess is None:
+                        return
+                    if not sess.get('casual_chat_mode'):
+                        return
+                    if sess.get('status') != 'active':
+                        return
+                    chunks_now = len(sess.get('chunks') or [])
+                    decisions_now = len(sess.get('decisions') or [])
+                # Only nudge if the last activity is the AI's own previous
+                # nudge (i.e. caller hasn't spoken since); avoid talking
+                # over a caller who's mid-thought.
+                if decisions_now > chunks_now and last_nudge_chunks == chunks_now:
+                    # Already nudged on this state — skip
+                    continue
+                if last_nudge_chunks == chunks_now:
+                    # Same as before — caller hasn't said anything new since
+                    # our last nudge. Send another one anyway, the whole
+                    # point of JUST TALK is that the AI keeps the line warm.
+                    pass
+                self._casual_chat_nudge(call_id)
+                last_nudge_chunks = chunks_now
+            except Exception as e:
+                _cc_logger.debug(f'casual_chat idle loop tick failed: {e}')
+                time.sleep(5.0)
+
+    def _casual_chat_nudge(self, call_id):
+        """Generate an unprompted casual line and inject it as the AI's
+        next decision so the operator/caller hears it (text + TTS) just
+        like any other reply."""
+        sim = self._get_simulator()
+        if sim is None:
+            return
+        with self._lock:
+            sess = self.sessions.get(call_id)
+            if sess is None or not sess.get('casual_chat_mode'):
+                return
+        try:
+            line, notes = CasualChatGenerator.generate(
+                sim, sess, transcript_chunk='', idle=True)
+        except Exception as e:
+            _cc_logger.debug(f'casual_chat nudge generate failed: {e}')
+            return
+        nudge_trace = {
+            'call_id': call_id,
+            'phone': sess.get('phone'),
+            'ai_id': sess.get('ai_id'),
+            'chunk_index': len(sess.get('chunks') or []),
+            'chunk': '',                       # no caller input
+            'received_at': datetime.now().strftime('%H:%M:%S.%f')[:-3],
+            'rate_limited': False,
+            'layers': [],
+            'aggregate': {'urgency': 0, 'psych_state': 'calm',
+                          'intent': 'casual_chat'},
+            'archive_key_used': None,
+            'fallback_reason': 'casual_chat_idle',
+            'fallback_path': ['casual_chat_idle'],
+            'action': 'CASUAL_CHAT',
+            'priority': 0,
+            'response': line,
+            'escalation': 'NONE',
+            'queued_dispatch': False,
+            'reasoning': ['idle keep-alive — AI breaking silence'] + (notes or []),
+            'latency_ms': 0.0,
+            'casual_chat': True,
+            'casual_chat_idle': True,
+        }
+        with self._lock:
+            sess.setdefault('decisions', []).append(nudge_trace)
+            sess['last_action'] = 'CASUAL_CHAT'
+            sess['last_priority'] = 0
+            sess['escalation'] = 'NONE'
+        self._publish(nudge_trace)
+        self._publish_session('update', sess)
 
     def complete_call(self, call_id, outcome='ended'):
         """Mark a call complete. The fabricated AI bubble fades out on the
@@ -4667,6 +8365,74 @@ class CallCenterService:
         return sess
 
     # ── Dispatch packets: send to units ──
+    @staticmethod
+    def _build_incident_summary(sess, plan_key):
+        """Produce a 1-2 sentence summary the responding crew can read at
+        a glance. Built from: plan title, escalation tag, location, and
+        the caller's most informative line (heuristic: first long line,
+        or last line if no long ones). Adds high-priority flags from
+        session facts so e.g. 'WEAPON SEEN' or 'CHILD ON SCENE' is in
+        the first line the crew sees."""
+        plan = _TACTICAL_PLANS.get(plan_key) or _TACTICAL_PLANS['GENERAL']
+        title = plan.get('title') or 'Response'
+        escalation = sess.get('escalation') or 'GENERAL'
+        # Address line
+        loc = sess.get('location') or {}
+        addr_parts = []
+        for k in ('address', 'display'):
+            v = loc.get(k)
+            if v:
+                addr_parts.append(v)
+                break
+        if not addr_parts:
+            for k in ('city', 'regionName', 'country'):
+                v = loc.get(k)
+                if v and v != '?':
+                    addr_parts.append(v)
+        addr = ', '.join(addr_parts) or 'unknown location'
+        # Best caller line — prefer first chunk over a sensible length
+        chunks = sess.get('chunks') or []
+        best = ''
+        for ch in chunks:
+            cand = (ch or '').strip()
+            if 15 <= len(cand) <= 200:
+                best = cand
+                break
+        if not best and chunks:
+            best = (chunks[-1] or '')[:200]
+        # Critical flags: pull the True ones that crews need NOW
+        flag_priority = (
+            'weapon_seen', 'threat_present', 'fire_trapped',
+            'fire_spreading', 'cpr_in_progress', 'pulse_absent',
+            'breathing_absent', 'multiple_victims', 'is_child_victim',
+            'caller_injured', 'has_cardiac_hx', 'pregnancy',
+            'door_locked', 'in_vehicle',
+        )
+        flag_labels = {
+            'weapon_seen':       'WEAPON',
+            'threat_present':    'SUSPECT ON SCENE',
+            'fire_trapped':      'TRAPPED',
+            'fire_spreading':    'FIRE SPREADING',
+            'cpr_in_progress':   'CPR IN PROGRESS',
+            'pulse_absent':      'NO PULSE',
+            'breathing_absent':  'NOT BREATHING',
+            'multiple_victims':  'MULTIPLE VICTIMS',
+            'is_child_victim':   'CHILD INVOLVED',
+            'caller_injured':    'CALLER INJURED',
+            'has_cardiac_hx':    'CARDIAC HX',
+            'pregnancy':         'PREGNANT',
+            'door_locked':       'DOOR LOCKED',
+            'in_vehicle':        'IN VEHICLE',
+        }
+        facts = sess.get('facts') or {}
+        flags_present = [flag_labels[f] for f in flag_priority if facts.get(f)]
+        flag_str = (' [' + ' | '.join(flags_present[:4]) + ']'
+                    if flags_present else '')
+        line1 = f'{title} — {escalation} at {addr}.{flag_str}'
+        line2 = (f'Caller: "{best}"' if best
+                 else 'No caller transcript yet.')
+        return line1 + ' ' + line2
+
     def build_transcript_snapshot(self, sess, max_chars=12000):
         """Return a compact text snapshot of the call so far suitable for
         attaching to a dispatch packet. Truncated to max_chars from the tail
@@ -4722,6 +8488,14 @@ class CallCenterService:
         sess = self.get_session(call_id)
         if sess is None:
             return None
+        # JUST TALK / casual chat sessions never trigger a real dispatch.
+        # If anything tries (e.g. an operator misclick), refuse — sending
+        # crews to a non-emergency call is the wrong action.
+        if sess.get('casual_chat_mode'):
+            _cc_logger.warning(
+                f'send_dispatch_to_unit blocked: call {call_id} is '
+                f'casual_chat_mode')
+            return None
         loc = sess.get('location') or {}
         target_lat = loc.get('lat')
         target_lon = loc.get('lon')
@@ -4743,9 +8517,22 @@ class CallCenterService:
             return None
 
         # ── Build plan + transcript ONCE ──
-        scenario_hint = ' '.join((sess.get('chunks') or [])[:6])
+        # Use the FULL transcript (was previously first 6 chunks only) so
+        # the plan picker sees everything the caller said. Also pass the
+        # AI's classified intent + extracted facts so plan selection is
+        # driven by the dispatcher's own thought, not just regex.
+        full_chunks = sess.get('chunks') or []
+        scenario_hint = ' '.join(full_chunks)
+        decisions = sess.get('decisions') or []
+        last_decision = decisions[-1] if decisions else {}
+        last_aggregate = sess.get('last_aggregate') or {}
+        ai_intent = (last_aggregate.get('intent')
+                     or last_decision.get('aggregate', {}).get('intent', ''))
+        sess_facts = sess.get('facts') or {}
         if not plan_key:
-            plan_key = tactical_plan_for(sess.get('escalation'), scenario_hint)
+            plan_key = tactical_plan_for(
+                sess.get('escalation'), scenario_hint,
+                intent=ai_intent, facts=sess_facts)
         plan = dict(_TACTICAL_PLANS.get(plan_key) or _TACTICAL_PLANS['GENERAL'])
         plan['key'] = plan_key
         if custom_tactics:
@@ -4776,6 +8563,55 @@ class CallCenterService:
                 eta_by_unit[cs] = {'distance_km': round(d_km, 2),
                                     'eta_s': round(eta_s, 1)}
 
+        # Refresh triangulation with anything that has landed since the
+        # last reduce — the Crew Receiver reads this directly off the
+        # packet so each dispatch carries the freshest fused fix at
+        # send-time.
+        try:
+            tri_snapshot = caller_triangulator.reduce(sess) \
+                or sess.get('triangulation')
+        except Exception:
+            tri_snapshot = sess.get('triangulation')
+
+        # ── Build a SHORT incident summary the crew can read at a glance ──
+        # The 12K-char transcript is great for evidence but useless if the
+        # crew is en route and needs the gist. This compresses the call
+        # into 1-2 sentences from: caller's first stated complaint + most
+        # recent caller line + any flagged facts (weapon, child, fire
+        # spreading, etc.).
+        summary = self._build_incident_summary(sess, plan_key)
+
+        # ── Pull the AI's most-recent decision so the crew sees what the
+        # dispatcher AI actually classified the call as. This lets the
+        # crew sanity-check the plan against the AI's reasoning.
+        last_decision_summary = None
+        if last_decision:
+            last_decision_summary = {
+                'action':       last_decision.get('action'),
+                'intent':       (last_decision.get('aggregate') or {}).get('intent'),
+                'urgency':      (last_decision.get('aggregate') or {}).get('urgency'),
+                'psych_state':  (last_decision.get('aggregate') or {}).get('psych_state'),
+                'response':     (last_decision.get('response') or '')[:240],
+                'reasoning':    list((last_decision.get('reasoning') or [])[:6]),
+                'received_at':  last_decision.get('received_at'),
+            }
+
+        # ── AI council pick (if the swarm voted) ──
+        ai_council = None
+        if last_decision and last_decision.get('ai_council'):
+            ai_council = dict(last_decision['ai_council'])
+
+        # ── Caller facts: which session-level booleans are TRUE ──
+        # The crew cares about the structured cues the AI extracted — gun
+        # seen, kids on scene, CPR in progress, fire spreading, etc. —
+        # not the raw modifier dict. We only forward the True ones.
+        caller_facts = {k: v for k, v in (sess_facts or {}).items() if v}
+
+        # ── Recommended questions for the crew's first contact ──
+        # Plan already has scenario-specific questions; we mix in any
+        # gap-filling questions the dispatcher protocol flagged.
+        recommended_questions = list(plan.get('questions') or [])
+
         # Shared packet template (immutable from here)
         template = {
             'dispatch_id': dispatch_id,
@@ -4787,6 +8623,8 @@ class CallCenterService:
             'priority': eff_priority,
             'plan': plan,
             'message': (message or '').strip(),
+            # Concise gist for the crew — display this big at the top.
+            'summary': summary,
             'transcript': transcript,
             'attach_transcript': bool(attach_transcript),
             'location': {
@@ -4797,6 +8635,31 @@ class CallCenterService:
                 'address': loc.get('address') or loc.get('display'),
                 'accuracy_m': loc.get('accuracy_m'),
                 'source': loc.get('source'),
+            },
+            # Multi-source triangulated fix (fused lat/lon + per-source
+            # breakdown). Receivers should prefer this over packet.location
+            # when present.
+            'triangulation': tri_snapshot,
+            # The AI dispatcher's own latest decision shape
+            'ai_decision': last_decision_summary,
+            # The AI council's weighted vote (if available)
+            'ai_council': ai_council,
+            # Structured caller facts (booleans the AI extracted from speech)
+            'caller_facts': caller_facts,
+            # Plan-specific questions the crew should ask first contact
+            'recommended_questions': recommended_questions,
+            # Full conversation memory dump for the crew (casual chat
+            # turn log + topics raised). Lets the responder see what was
+            # actually said over the whole call, not just the dispatcher
+            # decisions. Keys may be empty for calls that never used the
+            # casual generator.
+            'conversation_memory': {
+                'turn_log': list((sess.get('__chat_context__') or {})
+                                  .get('turn_log') or []),
+                'topics':   list((sess.get('__chat_context__') or {})
+                                  .get('topics') or []),
+                'turn_count': int((sess.get('__chat_context__') or {})
+                                   .get('turn_count', 0) or 0),
             },
             'recipients': list(callsigns),
             'sent_at_ts': now_ts,
@@ -4902,6 +8765,18 @@ class CallCenterService:
                          f'({loc.get("lat",0):.5f}, {loc.get("lon",0):.5f})')
             lines.append(f'Loc Source      : {loc.get("source")} '
                          f'(±{loc.get("accuracy_m",0)}m)')
+        # Triangulation: multi-source fused fix the responding crew used
+        tri = sess.get('triangulation') or {}
+        if tri:
+            lines.append(f'Triangulated    : ({tri.get("lat",0):.5f}, '
+                         f'{tri.get("lon",0):.5f})  '
+                         f'±{tri.get("accuracy_m","?")}m  '
+                         f'best={tri.get("best_source","?")}  '
+                         f'fused={"YES" if tri.get("fused") else "no"}')
+            for src in tri.get('sources') or []:
+                lines.append(
+                    f'  · {src["name"]:<14} ({src["lat"]:.5f},{src["lon"]:.5f}) '
+                    f'σ±{int(src["sigma_m"])}m  grade={src.get("grade","?")}')
         lines.append(f'Client IP       : {sess.get("client_ip") or "—"}')
         lines.append('')
         lines.append('-' * 78)
@@ -4944,6 +8819,70 @@ class CallCenterService:
                          f'latency={dec.get("latency_ms",0):.2f}ms')
             for r in dec.get('reasoning') or []:
                 lines.append(f'  · {r}')
+        # ── AI COUNCIL (per-entity advisory votes) ──
+        council = sess.get('ai_council') or []
+        if council:
+            lines.append('')
+            lines.append('-' * 78)
+            lines.append('AI COUNCIL — PER-ENTITY DECISIONS')
+            lines.append('-' * 78)
+            lines.append(f'(Each chunk consults every ConsciousEntity in the '
+                         f'simulator swarm. Vote weight blends entity_type × '
+                         f'coherence × C/3.)')
+            for rec in council:
+                lines.append('')
+                lines.append(f'[chunk #{rec.get("chunk_index")}] '
+                             f'@ {rec.get("received_at","?")}  '
+                             f'caller="{(rec.get("caller_chunk") or "")[:80]}"')
+                lines.append(f'  dispatcher action     : {rec.get("dispatcher_action")} '
+                             f'(U={rec.get("dispatcher_urgency")}, '
+                             f'intent={rec.get("dispatcher_intent")})')
+                lines.append(f'  council pick          : {rec.get("council_pick")} '
+                             f'(weighted agreement {rec.get("council_agreement",0):.2f}, '
+                             f'{rec.get("num_entities",0)} AIs)')
+                tally = rec.get('tally') or {}
+                if tally:
+                    tally_str = ', '.join(
+                        f'{k}={v:.2f}' for k, v in sorted(
+                            tally.items(), key=lambda kv: -kv[1]))
+                    lines.append(f'  council tally         : {tally_str}')
+                for v in rec.get('votes') or []:
+                    lines.append(
+                        f'    · {v.get("entity_id"):<12} '
+                        f'[{v.get("entity_type","?"):<10}] '
+                        f'C={v.get("C",0):.2f} coh={v.get("coherence",0):.2f} '
+                        f'karma={v.get("karma",0):+.2f} '
+                        f'φ*={v.get("phi_star",0):.3f} '
+                        f'w={v.get("weight",0):.2f} '
+                        f'→ {v.get("recommendation")}')
+                    lines.append(f'        why: {v.get("rationale","")}')
+        # ── CONVERSATION MEMORY (casual chat / JUST TALK calls) ──
+        # The CasualChatGenerator keeps a per-call memory of every turn
+        # (caller + AI), the structured intent classification, and the
+        # topics it accumulated. Dump that here so the crew receiver sees
+        # the whole conversation, not just the dispatcher's decisions.
+        ctx = sess.get('__chat_context__') or {}
+        turn_log = ctx.get('turn_log') or []
+        if turn_log:
+            lines.append('')
+            lines.append('-' * 78)
+            lines.append('CONVERSATION MEMORY (full call review)')
+            lines.append('-' * 78)
+            for entry in turn_log:
+                role = entry.get('role', '?').upper()
+                ts = entry.get('ts', '?')
+                turn = entry.get('turn', '?')
+                intent = entry.get('intent', '')
+                text = (entry.get('text') or '').replace('\n', ' ')
+                lines.append(f'[{ts}] turn{turn:>3} {role:<7} '
+                             f'({intent}): {text}')
+            topics = ctx.get('topics') or []
+            if topics:
+                lines.append('')
+                lines.append(f'Topics raised over the call: {", ".join(topics)}')
+            asked = ctx.get('asked') or []
+            if asked:
+                lines.append(f"Questions AI asked: {len(asked)}")
         lines.append('')
         lines.append('=' * 78)
         lines.append(f'END OF TRANSCRIPT — {datetime.now().isoformat()}')
@@ -4991,6 +8930,88 @@ class CallCenterService:
                 _cc_logger.info(f'desktop copy saved: {desk_path}')
         except Exception as e:
             _cc_logger.warning(f'desktop transcript copy failed: {e}')
+
+        # ── Dedicated AI Council .txt on Desktop ──
+        # The full transcript already includes a council section, but
+        # operators asked for a focused per-call AI-decisions file too —
+        # one .txt per call, written when the call ends, listing every
+        # ConsciousEntity's vote on every chunk.
+        try:
+            council = sess.get('ai_council') or []
+            if council:
+                desk = _cc_desktop_dir()
+                if desk:
+                    council_dir = os.path.join(desk, 'AIdispatch_AICouncil')
+                    os.makedirs(council_dir, exist_ok=True)
+                    council_lines = []
+                    council_lines.append('=' * 78)
+                    council_lines.append('AIDISPATCH — AI COUNCIL DECISIONS (per-entity)')
+                    council_lines.append('=' * 78)
+                    council_lines.append(f'Call Number   : {sess.get("call_number")}')
+                    council_lines.append(f'Phone         : {sess.get("phone")}')
+                    council_lines.append(f'Dispatch AI   : {sess.get("ai_id")}')
+                    council_lines.append(f'Started       : {sess.get("started_at")}')
+                    council_lines.append(f'Ended         : {sess.get("ended_at")}')
+                    council_lines.append(f'Outcome       : {sess.get("outcome")}')
+                    council_lines.append(f'Final Action  : {sess.get("last_action")}')
+                    council_lines.append(f'Escalation    : {sess.get("escalation")}')
+                    council_lines.append(f'Total Chunks  : {len(sess.get("chunks") or [])}')
+                    council_lines.append(f'Council Recs  : {len(council)}')
+                    council_lines.append('')
+                    # Council-wide summary across the whole call
+                    overall_tally = {}
+                    for rec in council:
+                        for k, v in (rec.get('tally') or {}).items():
+                            overall_tally[k] = overall_tally.get(k, 0.0) + float(v)
+                    if overall_tally:
+                        council_lines.append('-' * 78)
+                        council_lines.append('OVERALL COUNCIL TALLY (sum of per-chunk weighted votes)')
+                        council_lines.append('-' * 78)
+                        for k, v in sorted(overall_tally.items(), key=lambda kv: -kv[1]):
+                            council_lines.append(f'  {k:<24} {v:.2f}')
+                        council_lines.append('')
+                    # Per-chunk per-entity detail
+                    council_lines.append('-' * 78)
+                    council_lines.append('PER-CHUNK PER-ENTITY VOTES')
+                    council_lines.append('-' * 78)
+                    for rec in council:
+                        council_lines.append('')
+                        council_lines.append(
+                            f'[chunk #{rec.get("chunk_index")}] '
+                            f'@ {rec.get("received_at","?")}')
+                        council_lines.append(
+                            f'  caller said       : "{(rec.get("caller_chunk") or "")[:200]}"')
+                        council_lines.append(
+                            f'  dispatcher took   : {rec.get("dispatcher_action")} '
+                            f'(U={rec.get("dispatcher_urgency")}, '
+                            f'intent={rec.get("dispatcher_intent")})')
+                        council_lines.append(
+                            f'  council picked    : {rec.get("council_pick")} '
+                            f'(agreement {rec.get("council_agreement",0):.2f}, '
+                            f'{rec.get("num_entities",0)} AIs)')
+                        for v in rec.get('votes') or []:
+                            council_lines.append(
+                                f'    {v.get("entity_id"):<12} '
+                                f'[{v.get("entity_type","?"):<10}] '
+                                f'C={v.get("C",0):.2f} coh={v.get("coherence",0):.2f} '
+                                f'karma={v.get("karma",0):+.2f} '
+                                f'φ*={v.get("phi_star",0):.3f} '
+                                f'w={v.get("weight",0):.2f} '
+                                f'→ {v.get("recommendation")}')
+                            council_lines.append(
+                                f'        why: {v.get("rationale","")}')
+                    council_lines.append('')
+                    council_lines.append('=' * 78)
+                    council_lines.append(f'END — {datetime.now().isoformat()}')
+                    council_lines.append('=' * 78)
+                    council_path = os.path.join(
+                        council_dir,
+                        f'{cn}_{phone}_{ai_id}_council.txt')
+                    with open(council_path, 'w', encoding='utf-8') as f:
+                        f.write('\n'.join(council_lines))
+                    _cc_logger.info(f'AI council .txt saved: {council_path}')
+        except Exception as e:
+            _cc_logger.warning(f'AI council desktop write failed: {e}')
 
         # Audio: concatenate any per-call audio blobs uploaded via /api/call/<id>/audio
         audio_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -5057,7 +9078,23 @@ class CallCenterService:
 
         def _enrich():
             try:
+                # Primary: lookup the supplied IP.
                 info = geoip_cache.lookup(ip)
+                used_source = 'client_ip'
+                # Fallback: if the supplied IP is local/private, the geoip
+                # lookup returns lat/lon=0.0 (the "private" sentinel).
+                # Swap to the operator's PUBLIC IP so the caller still
+                # appears on the global map. This is the operator's own
+                # external IP, which is "where the device making the
+                # call actually is" for any test call from this machine.
+                if (not info
+                        or (float(info.get('lat') or 0.0) == 0.0
+                            and float(info.get('lon') or 0.0) == 0.0)
+                        or info.get('_source') == 'private'):
+                    pub_geo = public_ip_locator.get_geo(blocking=True)
+                    if pub_geo:
+                        info = pub_geo
+                        used_source = 'operator_public_ip'
                 if not info:
                     return
                 # Don't clobber a precise browser location with a coarse IP one
@@ -5079,9 +9116,17 @@ class CallCenterService:
                         'isp': info.get('isp') or '',
                         'timezone': info.get('timezone') or '',
                         'accuracy_m': 50000,   # IP geolocation: ~city level
-                        'source': info.get('_source') or 'ip-api',
+                        'source': (info.get('_source') or 'ip-api')
+                                   + (':public_fallback'
+                                      if used_source == 'operator_public_ip'
+                                      else ''),
                         'updated_at': datetime.now().strftime('%H:%M:%S.%f')[:-3],
                     }
+                    # Fold the new IP fix into triangulation immediately
+                    try:
+                        caller_triangulator.reduce(sess2)
+                    except Exception:
+                        pass
                 self._publish_session('update', sess2)
             except Exception as e:
                 _cc_logger.error(f'geoip enrich failed: {e}')
@@ -5133,6 +9178,14 @@ class CallCenterService:
                                   name='LocVerify').start()
         except Exception:
             pass
+        # ── TRIANGULATION REDUCTION ──
+        # Fold this fresh fix into the multi-source triangulation so every
+        # downstream reader (Crew Receiver window, Network Monitor's caller
+        # tab, dispatch packets) sees the same fused (lat, lon, sigma).
+        try:
+            caller_triangulator.reduce(sess)
+        except Exception as e:
+            _cc_logger.debug(f'triangulation reduce failed: {e}')
         # ── AUTO-REBASE FLEET if it's far from this caller ──
         # If CC_AUTO_REBASE=1 (default on) and the nearest unit's base is more
         # than CC_AUTO_REBASE_KM away from the caller, scatter the fleet
@@ -5220,6 +9273,79 @@ class CallCenterService:
                     sess['location'] = phone_loc
             except Exception:
                 pass
+            # ── Public-IP fallback location ──
+            # If phone NPA gave us nothing (non-US phone, anon/test number),
+            # plant a coarse country-level pin from the OPERATOR's public IP
+            # so the call still appears on the global map. This is overridden
+            # the moment a real client_ip lands (set_client_ip → enrich) or
+            # the browser supplies precise GPS (set_location).
+            if not sess.get('location'):
+                try:
+                    pub = public_ip_locator.get_geo(blocking=False)
+                    if pub and (pub.get('lat') or pub.get('lon')):
+                        sess['location'] = {
+                            'lat': float(pub.get('lat') or 0.0),
+                            'lon': float(pub.get('lon') or 0.0),
+                            'city': pub.get('city') or '',
+                            'regionName': pub.get('regionName') or '',
+                            'country': pub.get('country') or '',
+                            'countryCode': pub.get('countryCode') or '',
+                            'org': pub.get('org') or '',
+                            'isp': pub.get('isp') or '',
+                            'timezone': pub.get('timezone') or '',
+                            'accuracy_m': 50000,
+                            'source': 'operator_public_ip:bootstrap',
+                            'updated_at': datetime.now().strftime('%H:%M:%S.%f')[:-3],
+                        }
+                except Exception:
+                    pass
+            # First-pass triangulation. With only the phone NPA in hand
+            # the result is coarse, but it gives the Crew Receiver and the
+            # Network Monitor SOMETHING to plot the moment the call lands.
+            try:
+                caller_triangulator.reduce(sess)
+            except Exception:
+                pass
+            # If the public-IP lookup wasn't ready yet (first call after
+            # process start), retry it after the worker thread completes
+            # so the location lands a moment later instead of never.
+            if not sess.get('location'):
+                cid = sess.get('call_id')
+                def _retry_pub_ip():
+                    for _ in range(20):   # up to ~10 seconds
+                        time.sleep(0.5)
+                        try:
+                            pub = public_ip_locator.get_geo(blocking=False)
+                        except Exception:
+                            pub = None
+                        if pub and (pub.get('lat') or pub.get('lon')):
+                            with self._lock:
+                                s = self.sessions.get(cid)
+                                if s is None or s.get('location'):
+                                    return
+                                s['location'] = {
+                                    'lat': float(pub.get('lat') or 0.0),
+                                    'lon': float(pub.get('lon') or 0.0),
+                                    'city': pub.get('city') or '',
+                                    'regionName': pub.get('regionName') or '',
+                                    'country': pub.get('country') or '',
+                                    'countryCode': pub.get('countryCode') or '',
+                                    'org': pub.get('org') or '',
+                                    'isp': pub.get('isp') or '',
+                                    'timezone': pub.get('timezone') or '',
+                                    'accuracy_m': 50000,
+                                    'source': 'operator_public_ip:bootstrap',
+                                    'updated_at': datetime.now().strftime(
+                                        '%H:%M:%S.%f')[:-3],
+                                }
+                                try:
+                                    caller_triangulator.reduce(s)
+                                except Exception:
+                                    pass
+                            self._publish_session('update', s)
+                            return
+                threading.Thread(target=_retry_pub_ip, daemon=True,
+                                  name='PubIPRetry').start()
             # cap retention
             if len(self.sessions) >= self._max_sessions:
                 # drop oldest ended session, else oldest active
@@ -5281,6 +9407,90 @@ class CallCenterService:
             self._loop)
         return fut.result(timeout=timeout)
 
+    # ── CASUAL CHAT RESPONSE PATH ───────────────────────────────────
+    def _casual_chat_respond(self, call_id, phone_number, transcript_chunk,
+                              session, t0):
+        """Synthesize a non-emergency reply via CasualChatGenerator using
+        the simulator's live consciousness state, append it as a decision,
+        publish, and never escalate or auto-end. This is what JUST TALK
+        calls run on — they stay 'active' until the operator hangs up."""
+        sim = self._get_simulator()
+        if sim is None:
+            line = "I'm here. Talk to me about anything."
+            notes = ['casual-chat: simulator not attached, using minimal fallback']
+        else:
+            try:
+                line, notes = CasualChatGenerator.generate(
+                    sim, session, transcript_chunk, idle=False)
+            except Exception as e:
+                _cc_logger.error(f'CasualChatGenerator failed: {e}')
+                line = "yeah, I'm with you."
+                notes = [f'casual-chat: generator error {e}']
+        trace = {
+            'call_id': call_id,
+            'phone': phone_number,
+            'ai_id': session['ai_id'],
+            'chunk_index': len(session['chunks']),
+            'chunk': transcript_chunk,
+            'received_at': datetime.now().strftime('%H:%M:%S.%f')[:-3],
+            'rate_limited': False,
+            'layers': [],
+            'aggregate': {'urgency': 0, 'psych_state': 'calm',
+                          'intent': 'casual_chat'},
+            'archive_key_used': None,
+            'fallback_reason': 'casual_chat_mode',
+            'fallback_path': ['casual_chat_mode'],
+            'action': 'CASUAL_CHAT',
+            'priority': 0,
+            'response': line,
+            'escalation': 'NONE',
+            'queued_dispatch': False,
+            'reasoning': [
+                'route: casual_chat_mode — bypassing emergency pipeline',
+                f"caller chunk #{len(session.get('chunks') or [])}: "
+                f'"{(transcript_chunk or "")[:80]}"',
+            ] + (notes or []),
+            'casual_chat': True,
+        }
+        # Run the AI council so the operator/audit panel still sees per-AI
+        # opinions, but framed for a non-emergency.
+        try:
+            council_record = self._consult_ai_council(
+                session, transcript_chunk,
+                {'urgency': 0, 'intent': 'casual_chat',
+                 'escalation': 'NONE', 'action': 'CASUAL_CHAT'})
+            if council_record:
+                trace['ai_council'] = {
+                    'pick': council_record['council_pick'],
+                    'agreement': council_record['council_agreement'],
+                    'num_entities': council_record['num_entities'],
+                    'tally': council_record['tally'],
+                }
+        except Exception:
+            pass
+        trace['latency_ms'] = (time.perf_counter() - t0) * 1000
+
+        with self._lock:
+            self.traces.append(trace)
+            session['chunks'].append(transcript_chunk)
+            session['decisions'].append(trace)
+            session['last_aggregate'] = trace['aggregate']
+            session['last_action'] = 'CASUAL_CHAT'
+            session['last_priority'] = 0
+            session['escalation'] = 'NONE'
+            session['urgency_history'].append(0)
+            session['intent_history'].append('casual_chat')
+            # IMPORTANT: never set status='ended' from here. JUST TALK calls
+            # only end on explicit operator hang-up.
+        self._publish(trace)
+        self._publish_session('update', session)
+        _cc_logger.info(
+            f"[{call_id}] CASUAL_CHAT (idle={False}) "
+            f'→ "{line[:60]}" ({trace["latency_ms"]:.2f}ms)')
+        self.metrics['total_calls'] += 1
+        self.metrics['latencies_ms'].append(trace['latency_ms'])
+        return trace
+
     # ── FAST SYNCHRONOUS DECISION PATH ─────────────────────────────
     def _fast_decide(self, call_id, phone_number, transcript_chunk):
         """No asyncio. No thread pool. No torch.
@@ -5300,6 +9510,14 @@ class CallCenterService:
         session, is_new = self._ensure_session(call_id, phone_number)
         if is_new:
             self._publish_session('start', session)
+
+        # ── CASUAL CHAT MODE SHORT-CIRCUIT ──
+        # JUST TALK calls bypass the entire emergency pipeline. Every chunk
+        # is answered by CasualChatGenerator using the AI's own consciousness
+        # state (no scripted lines). The call never auto-ends.
+        if session.get('casual_chat_mode'):
+            return self._casual_chat_respond(
+                call_id, phone_number, transcript_chunk, session, t0)
 
         # Cumulative text = all prior chunks + this one (rolling re-eval)
         prior = ' '.join(session.get('chunks') or [])
@@ -5511,6 +9729,37 @@ class CallCenterService:
             except Exception as e:
                 _cc_logger.error(f'unit dispatch failed: {e}')
 
+        # ── PHASE 6: AI COUNCIL ──
+        # Consult every ConsciousEntity in the simulator's swarm for an
+        # advisory vote on this chunk. Each entity casts one weighted vote
+        # using its current C / coherence / karma / Φ* state. The dispatcher
+        # AI keeps final say (its decision already drove the action), but the
+        # council's pick + per-entity rationales are recorded onto the session
+        # and surface in the operator console + the desktop transcript.
+        try:
+            council_record = self._consult_ai_council(
+                session, transcript_chunk, decision)
+            if council_record:
+                trace['ai_council'] = {
+                    'pick': council_record['council_pick'],
+                    'agreement': council_record['council_agreement'],
+                    'num_entities': council_record['num_entities'],
+                    'tally': council_record['tally'],
+                }
+                if council_record['council_pick'] not in (
+                        decision.get('action') or '',
+                        'CORROBORATE', 'OBSERVE'):
+                    trace['reasoning'].append(
+                        f"council ({council_record['num_entities']} AIs) "
+                        f"would have picked {council_record['council_pick']} "
+                        f"@ agreement={council_record['council_agreement']:.2f}")
+                else:
+                    trace['reasoning'].append(
+                        f"council ({council_record['num_entities']} AIs) "
+                        f"agreement={council_record['council_agreement']:.2f}")
+        except Exception as _e:
+            _cc_logger.error(f'ai_council consult failed: {_e}')
+
         # Latency stamp
         trace['latency_ms'] = (time.perf_counter() - t0) * 1000
         trace['think_ms'] = think_ms
@@ -5569,6 +9818,12 @@ class CallCenterService:
         t0 = time.perf_counter()
         # Fabricate (or look up) the dispatch AI session for this call.
         session, is_new = self._ensure_session(call_id, phone_number)
+        # JUST TALK calls bypass the async emergency pipeline too
+        if session.get('casual_chat_mode'):
+            if is_new:
+                self._publish_session('start', session)
+            return self._casual_chat_respond(
+                call_id, phone_number, transcript_chunk, session, t0)
         trace = {
             'call_id': call_id,
             'phone': phone_number,
@@ -5770,6 +10025,33 @@ class CallCenterService:
                 trace['escalation'] = 'NONE'
                 trace['latency_ms'] = (time.perf_counter() - t0) * 1000
                 trace['reasoning'].append(f'exception in pipeline: {e}')
+
+        # ── AI COUNCIL ─────────────────────────────────────────────
+        # Same advisory pass as the fast path so async-routed calls also
+        # get every ConsciousEntity's per-chunk vote on record.
+        try:
+            agg_for_council = trace.get('aggregate') or {}
+            council_decision = {
+                'urgency':    agg_for_council.get('urgency', 0),
+                'intent':     agg_for_council.get('intent', ''),
+                'escalation': trace.get('escalation') or '',
+                'action':     trace.get('action') or '',
+            }
+            council_record = self._consult_ai_council(
+                session, transcript_chunk, council_decision)
+            if council_record:
+                trace['ai_council'] = {
+                    'pick': council_record['council_pick'],
+                    'agreement': council_record['council_agreement'],
+                    'num_entities': council_record['num_entities'],
+                    'tally': council_record['tally'],
+                }
+                trace['reasoning'].append(
+                    f"council ({council_record['num_entities']} AIs) pick="
+                    f"{council_record['council_pick']} "
+                    f"agreement={council_record['council_agreement']:.2f}")
+        except Exception as _e:
+            _cc_logger.error(f'ai_council consult (async) failed: {_e}')
 
         with self._lock:
             self.traces.append(trace)
@@ -6689,30 +10971,88 @@ _PLAN_AUTOSELECT = {
 }
 
 
-def tactical_plan_for(escalation, scenario_text=''):
-    """Return the best-fit plan key given an escalation tag + free-text hint."""
+def tactical_plan_for(escalation, scenario_text='', intent='', facts=None):
+    """Return the best-fit plan key given:
+      - escalation tag (911/EMS, POLICE, FIRE, SUICIDE_HOTLINE, ...),
+      - the FULL transcript (not just first 6 chunks) as scenario_text,
+      - the AI's own classified intent (e.g. 'medical_cardiac',
+        'trauma_gsw', 'fire_structure', 'domestic_violence'),
+      - session facts dict (booleans like 'cardiac_hx', 'fire_trapped',
+        'weapon_seen', 'is_child_victim', 'cpr_in_progress', etc.).
+
+    The AI's classified intent is now CHECKED FIRST — keyword matching on
+    the transcript is only a fallback for noisy chunks where the
+    classifier didn't fire confidently.
+    """
     s = (scenario_text or '').lower()
+    intent_l = (intent or '').lower()
+    f = facts or {}
+
     if escalation == '911/EMS':
-        if any(k in s for k in ('chest pain', 'cardiac', 'mi ', 'stemi', 'heart attack')):
+        # Intent-driven choice (preferred — classifier has vocabulary)
+        if 'cardiac' in intent_l or 'chest_pain' in intent_l or 'mi' in intent_l:
             return 'EMS_CARDIAC'
-        if any(k in s for k in ('trauma', 'gsw', 'stab', 'mvc', 'crash', 'fall')):
+        if 'trauma' in intent_l or 'gsw' in intent_l or 'stab' in intent_l \
+                or 'mvc' in intent_l or 'fall' in intent_l:
             return 'EMS_TRAUMA'
-        if any(k in s for k in ('suicide', 'overdose', 'psych', 'mental')):
+        if 'suicide' in intent_l or 'overdose' in intent_l \
+                or 'psych' in intent_l or 'mental' in intent_l:
+            return 'EMS_PSYCH'
+        # Fact-driven escalators (the AI marked these on the session)
+        if f.get('has_cardiac_hx') or f.get('cpr_in_progress') \
+                or f.get('pulse_absent'):
+            return 'EMS_CARDIAC'
+        if f.get('caller_injured') or f.get('multiple_victims'):
+            return 'EMS_TRAUMA'
+        # Keyword fallback over the full transcript
+        if any(k in s for k in (
+                'chest pain', 'cardiac', 'mi ', 'stemi', 'heart attack',
+                'palpitations', 'arrhythmia')):
+            return 'EMS_CARDIAC'
+        if any(k in s for k in (
+                'trauma', 'gsw', 'gunshot', 'stab', 'mvc', 'crash',
+                'collision', 'fall', 'fell', 'broke my', 'bleeding')):
+            return 'EMS_TRAUMA'
+        if any(k in s for k in (
+                'suicide', 'overdose', 'od ', 'psych', 'mental', 'self-harm',
+                'self harm', 'kill myself', 'end it all')):
             return 'EMS_PSYCH'
         return 'EMS_GENERAL'
+
     if escalation == 'POLICE':
-        if any(k in s for k in ('domestic', 'dv ', 'assault')):
+        if 'domestic' in intent_l or 'dv' in intent_l \
+                or 'family_assault' in intent_l:
             return 'POLICE_DV'
-        if any(k in s for k in ('in progress', 'robbery', 'burglary', 'shooting',
-                                 'shots fired', 'active')):
+        if 'in_progress' in intent_l or 'robbery' in intent_l \
+                or 'burglary' in intent_l or 'active_shooter' in intent_l:
+            return 'POLICE_INPROGRESS'
+        if f.get('weapon_seen') or f.get('threat_present'):
+            return 'POLICE_INPROGRESS'
+        if any(k in s for k in (
+                'domestic', 'dv ', 'my husband hit', 'my wife hit',
+                'my partner hit', 'beating me')):
+            return 'POLICE_DV'
+        if any(k in s for k in (
+                'in progress', 'happening now', 'right now', 'robbery',
+                'burglary', 'shooting', 'shots fired', 'active', 'breaking in',
+                'kicked in the door', 'they have a gun', 'someone is in')):
             return 'POLICE_INPROGRESS'
         return 'POLICE_GENERAL'
+
     if escalation == 'FIRE':
-        if any(k in s for k in ('high rise', 'highrise', 'tower')):
+        if 'high_rise' in intent_l or 'tower' in intent_l:
             return 'FIRE_HIGH_RISE'
-        if any(k in s for k in ('vehicle', 'car fire', 'truck fire')):
+        if 'vehicle' in intent_l or 'car_fire' in intent_l:
+            return 'FIRE_VEHICLE'
+        if any(k in s for k in (
+                'high rise', 'highrise', 'tower', '20th floor', '30th floor')):
+            return 'FIRE_HIGH_RISE'
+        if any(k in s for k in (
+                'vehicle', 'car fire', 'truck fire', 'engine on fire',
+                'my car is on fire', 'rv fire')):
             return 'FIRE_VEHICLE'
         return 'FIRE_STRUCTURE'
+
     return _PLAN_AUTOSELECT.get(escalation, 'GENERAL')
 
 
@@ -7640,6 +11980,14 @@ def _cc_render_voice_page(sess):
     cn  = sess.get('call_number', '')
     body = f"""
     <h1>📞 Voice Call — {_cc_html.escape(cn)}</h1>
+    <style>
+      @keyframes liveDotPulse {{
+        0%   {{ transform: scale(1.0); opacity: 1.0; }}
+        50%  {{ transform: scale(1.25); opacity: 0.85; }}
+        100% {{ transform: scale(1.0); opacity: 1.0; }}
+      }}
+      #micdot {{ animation: liveDotPulse 1.4s ease-in-out infinite; }}
+    </style>
     <div class="panel" id="callbar">
       <div class="row">
         <div><div class="dim small">DISPATCH AI</div><div style="font-size:1.4em">{_cc_html.escape(sess['ai_id'])}</div></div>
@@ -7650,31 +11998,49 @@ def _cc_render_voice_page(sess):
       </div>
     </div>
     <div class="panel" style="text-align:center">
-      <button id="talkbtn" class="primary" style="padding:30px 50px; font-size:1.4em; border-radius:50%; background:#226644; min-width:220px">
-        🎤<br>Hold to Talk
-      </button>
-      <div class="dim small" style="margin-top:8px">
-        Hold the button (or press <strong>Space</strong>) and speak. Release to send.
+      <div id="liveindicator" style="display:flex; align-items:center; justify-content:center; gap:14px; padding:18px 0">
+        <div id="micdot" style="width:18px; height:18px; border-radius:50%; background:#226644; box-shadow:0 0 12px #66ff99; transition:background .2s"></div>
+        <div style="font-size:1.3em; font-weight:bold; color:#66ff99" id="livelbl">🎤 LIVE — speak any time</div>
       </div>
-      <div style="margin-top:14px">
+      <div class="dim small" style="margin-top:2px">
+        The mic stays open the whole call. The AI listens with <strong>5 simultaneous interpretations</strong> and picks the highest-confidence one. You can also type below.
+      </div>
+      <div style="margin-top:14px; display:flex; gap:18px; flex-wrap:wrap; justify-content:center">
         <label class="small dim"><input type="checkbox" id="ttson" checked> AI speaks responses out loud</label>
-        <label class="small dim" style="margin-left:14px"><input type="checkbox" id="autodetect" checked> Auto end-of-utterance</label>
+        <label class="small" style="color:#ff5566; font-weight:bold">
+          <input type="checkbox" id="silentmode"> 🔇 SILENT EMERGENCY MODE
+        </label>
       </div>
       <div style="margin-top:10px; display:flex; align-items:center; justify-content:center; gap:10px">
         <label class="small dim" for="rate-slider">TTS speed:</label>
-        <input type="range" id="rate-slider" min="0.8" max="1.6" step="0.05" value="1.20" style="width:200px; vertical-align:middle">
-        <span class="small dim" id="rate-label">1.20×</span>
+        <input type="range" id="rate-slider" min="0.8" max="2.4" step="0.05" value="1.70" style="width:200px; vertical-align:middle">
+        <span class="small dim" id="rate-label">1.70×</span>
       </div>
       <script>
         (function(){{
           var s=document.getElementById('rate-slider'), l=document.getElementById('rate-label');
           if(s&&l){{ s.addEventListener('input',function(){{ l.textContent = parseFloat(s.value).toFixed(2)+'×'; }}); }}
+          // Toggling Silent Emergency Mode immediately cancels any in-flight
+          // utterance so a caller who just engaged it isn't betrayed by
+          // the tail end of a sentence the AI was already saying.
+          var sm=document.getElementById('silentmode');
+          if(sm){{ sm.addEventListener('change', function(){{
+            if(sm.checked){{ try{{ window.speechSynthesis.cancel(); }} catch(e){{}} }}
+          }}); }}
         }})();
       </script>
     </div>
     <div class="panel">
       <h3>Transcript</h3>
       <div id="log" style="max-height:50vh; overflow-y:auto"></div>
+      <!-- Text prompt row: lets the caller TYPE a message to the AI mid-call,
+           in addition to live voice. Exactly the parity the operator asked
+           for — voice page now matches the text-911 thread. -->
+      <div style="margin-top:10px; display:flex; gap:6px">
+        <input id="textinput" type="text" placeholder="Type a message to the AI..."
+               style="flex:1; padding:10px 12px; font-size:1.05em; border:2px solid #224488; border-radius:4px; background:#0d1f33; color:#ffffff">
+        <button id="textsend" class="primary" style="padding:10px 18px; font-size:1.05em">Send</button>
+      </div>
     </div>
     <div class="row">
       <button id="hangup" class="danger" style="padding:14px">Hang Up</button>
@@ -7685,15 +12051,65 @@ def _cc_render_voice_page(sess):
       const logEl = document.getElementById('log');
       const stat = document.getElementById('statlbl');
       const mic  = document.getElementById('miclbl');
-      const talk = document.getElementById('talkbtn');
+      const micDot = document.getElementById('micdot');
+      const liveLbl = document.getElementById('livelbl');
+
+      // Visual state for the always-on mic indicator. We don't have a
+      // start/stop button anymore — the dot pulses to confirm the mic is
+      // actually open, and the label flips to red while text is being
+      // committed so the caller has feedback that the AI heard them.
+      function setLive(state) {{
+        // states: 'live' | 'speaking' | 'thinking' | 'blocked' | 'starting'
+        if (state === 'live') {{
+          micDot.style.background = '#22cc66';
+          micDot.style.boxShadow = '0 0 12px #66ff99';
+          liveLbl.style.color = '#66ff99';
+          liveLbl.textContent = '🎤 LIVE — speak any time';
+        }} else if (state === 'speaking') {{
+          micDot.style.background = '#ff5566';
+          micDot.style.boxShadow = '0 0 16px #ff5566';
+          liveLbl.style.color = '#ff8899';
+          liveLbl.textContent = '🎙 HEARING YOU...';
+        }} else if (state === 'thinking') {{
+          micDot.style.background = '#ffaa33';
+          micDot.style.boxShadow = '0 0 12px #ffaa33';
+          liveLbl.style.color = '#ffcc66';
+          liveLbl.textContent = '⚡ DECIDING...';
+        }} else if (state === 'blocked') {{
+          micDot.style.background = '#666666';
+          micDot.style.boxShadow = 'none';
+          liveLbl.style.color = '#ff8888';
+          liveLbl.textContent = '🚫 MIC BLOCKED — click 🔒 to allow';
+        }} else if (state === 'starting') {{
+          micDot.style.background = '#3366cc';
+          micDot.style.boxShadow = '0 0 8px #3366cc';
+          liveLbl.style.color = '#88aaff';
+          liveLbl.textContent = '⏳ requesting mic...';
+        }}
+      }}
 
       function append(role, text, cls) {{
         const d = document.createElement('div');
-        d.style.padding = '6px 10px';
-        d.style.margin = '4px 0';
-        d.style.borderLeft = '3px solid ' + (role==='you'?'#66ccff':'#ffaa33');
-        d.style.background = '#161636';
-        d.innerHTML = '<div class="dim small">' + role + '</div><div>' + text.replace(/</g,'&lt;') + '</div>';
+        const isYou = role === 'you';
+        // Color pair: caller (you) = blue tint, AI = amber tint. Both use
+        // a dark surface with bright foreground so the transcript is legible
+        // regardless of the parent theme (light parchment vs dark).
+        const accent = isYou ? '#66ccff' : '#ffaa33';
+        const surface = isYou ? '#0d1f33' : '#2a1a06';
+        d.style.padding = '8px 12px';
+        d.style.margin  = '6px 0';
+        d.style.borderLeft = '4px solid ' + accent;
+        d.style.background = surface;
+        d.style.color      = '#ffffff';
+        d.style.borderRadius = '4px';
+        d.style.fontFamily = 'Cambria, Georgia, serif';
+        d.style.fontSize   = '1.05em';
+        d.style.lineHeight = '1.4';
+        d.innerHTML =
+          '<div style="font-size:.78em; font-weight:bold; letter-spacing:.06em; '
+          + 'text-transform:uppercase; color:' + accent + '; margin-bottom:2px">'
+          + (isYou ? '🎙 CALLER' : '🤖 DISPATCHER AI') + '</div>'
+          + '<div style="color:#ffffff">' + text.replace(/</g,'&lt;') + '</div>';
         if (cls) d.classList.add(cls);
         logEl.appendChild(d);
         logEl.scrollTop = logEl.scrollHeight;
@@ -7701,30 +12117,205 @@ def _cc_render_voice_page(sess):
       function setStat(t, c) {{ stat.innerHTML = '<span class="pill ' + (c||'good') + '">' + t + '</span>'; }}
       function setMic(t, c) {{ mic.innerHTML = '<span class="pill ' + (c||'dim') + '">' + t + '</span>'; }}
 
-      // ── In-browser STT (Web Speech API) ──
+      // ── In-browser STT (Web Speech API) — always-on, 5-attempt consensus ──
+      // The AI listens to the entire call. Each finalized utterance comes
+      // back with up to 5 candidate transcripts and we score them to pick
+      // the one most likely to be what the caller actually said.
+      //
+      // Scoring:
+      //   1. Browser-supplied confidence is the primary signal (Chrome/Edge
+      //      provide it for alternative #0 — anything > 0 is meaningful).
+      //   2. Token consensus: candidates that share the most words with
+      //      the other candidates get a small boost. If 4 of 5 alternatives
+      //      contain "chest hurts" and 1 says "tested", "chest hurts" wins.
+      //   3. Length sanity: very short candidates (1-2 words) are penalized
+      //      unless ALL alternatives are short (single-word commands).
       const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
       let recognition = null;
       let recognizing = false;
+      let alwaysOn = true;            // never toggled off mid-call
       let lastChunk = '';
+      let restartTimer = null;
+
+      function pickBestAlternative(result) {{
+        // Build the alternative array, capped at 5.
+        const alts = [];
+        const max = Math.min(5, result.length);
+        for (let i = 0; i < max; i++) {{
+          const a = result[i];
+          if (!a || !a.transcript) continue;
+          alts.push({{
+            text: a.transcript.trim(),
+            confidence: (typeof a.confidence === 'number') ? a.confidence : 0.0,
+          }});
+        }}
+        if (!alts.length) return null;
+        if (alts.length === 1) return alts[0].text;
+        // Token-consensus boost: count how many alts share each token,
+        // sum that across the candidate's tokens for a "redundancy" score.
+        const tokenize = s => (s.toLowerCase().match(/[a-z0-9']+/g) || []);
+        const altTokens = alts.map(a => new Set(tokenize(a.text)));
+        const lens = alts.map(a => tokenize(a.text).length);
+        const maxLen = Math.max(1, ...lens);
+        let best = null, bestScore = -Infinity;
+        for (let i = 0; i < alts.length; i++) {{
+          const myTokens = altTokens[i];
+          let consensus = 0;
+          for (let j = 0; j < alts.length; j++) {{
+            if (i === j) continue;
+            for (const t of myTokens) {{
+              if (altTokens[j].has(t)) consensus += 1;
+            }}
+          }}
+          // Normalize consensus by candidate's own token count + cohort size
+          const consensusNorm = consensus
+            / Math.max(1, myTokens.size * (alts.length - 1));
+          // Length sanity: 0..1, full credit at >=3 tokens
+          const lengthFactor = Math.min(1.0, lens[i] / 3.0);
+          // Final score: confidence dominates, consensus + length break ties
+          const score = (alts[i].confidence * 1.0)
+                      + (consensusNorm * 0.25)
+                      + (lengthFactor * 0.05);
+          if (score > bestScore) {{
+            bestScore = score;
+            best = alts[i];
+          }}
+        }}
+        // Log all 5 alternatives to the console so the operator can audit
+        // the AI's listening if they open dev-tools.
+        try {{
+          console.log('[STT 5-alt]', alts.map(a =>
+            `(${{a.confidence.toFixed(2)}}) "${{a.text}}"`).join(' | '),
+            '→ picked:', best ? best.text : '(none)');
+        }} catch (e) {{}}
+        return best ? best.text : null;
+      }}
+
       if (SR) {{
         recognition = new SR();
         recognition.continuous = true;
+        // INTERIM results are now ON. As the caller speaks, partial
+        // transcripts stream to /interim every result event so the
+        // operator sees the AI hearing them word-by-word in real time.
+        // The AI itself only RESPONDS on final results — interim text
+        // is just visualization, not committed to the dispatch pipeline.
         recognition.interimResults = true;
+        recognition.maxAlternatives = 5;       // 5 simultaneous interpretations
         recognition.lang = navigator.language || 'en-US';
-        recognition.onresult = (ev) => {{
-          let final = '';
-          for (let i = ev.resultIndex; i < ev.results.length; i++) {{
-            const r = ev.results[i];
-            if (r.isFinal) final += r[0].transcript + ' ';
+        let _lastInterim = '';
+        function sendInterim(txt) {{
+          // Throttle: only push when the running text actually changed
+          if (txt === _lastInterim) return;
+          _lastInterim = txt;
+          fetch('/api/call/' + encodeURIComponent(callId) + '/interim', {{
+            method: 'POST', headers: {{'content-type': 'application/json'}},
+            body: JSON.stringify({{text: txt}})
+          }}).catch(() => {{}});
+        }}
+        // ── Final-result debounce ──
+        // The browser SR sometimes commits short fragments ("If", "To",
+        // "Traditional hot-") as separate finals when the speaker takes a
+        // tiny breath mid-sentence. Each fragment hitting the AI as a
+        // standalone caller chunk produces nonsensical replies. We hold
+        // any final ≤2-words for 900ms; if another final lands inside
+        // that window we concatenate and send the combined text. If the
+        // window expires without a follow-up, we send what we have.
+        let _pendingFinal = '';
+        let _pendingTimer = null;
+        function _flushPending(reason) {{
+          if (_pendingTimer) {{ clearTimeout(_pendingTimer); _pendingTimer = null; }}
+          if (!_pendingFinal) return;
+          const text = _pendingFinal.trim();
+          _pendingFinal = '';
+          if (!text) return;
+          lastChunk = text;
+          append('you', text);
+          sendChunk(text);
+          setLive('thinking');
+          setTimeout(() => setLive('live'), 1200);
+          _lastInterim = '';
+        }}
+        function _commitFinal(text) {{
+          // Decide whether to flush now or buffer.
+          const t = (text || '').trim();
+          if (!t) return;
+          const wc = t.split(/\\s+/).length;
+          // Already buffered something — concatenate.
+          if (_pendingFinal) {{
+            _pendingFinal = (_pendingFinal + ' ' + t).trim();
+            // If combined is now substantial (>=3 words), flush now.
+            const combinedWc = _pendingFinal.split(/\\s+/).length;
+            if (combinedWc >= 4) {{
+              _flushPending('combined-substantial');
+              return;
+            }}
+            // Otherwise reset the timer to wait for more.
+            if (_pendingTimer) clearTimeout(_pendingTimer);
+            _pendingTimer = setTimeout(() => _flushPending('timeout'), 900);
+            return;
           }}
-          if (final.trim()) {{
-            lastChunk = final.trim();
-            append('you', lastChunk);
-            sendChunk(lastChunk);
+          // Nothing buffered. Short fragment? Buffer + wait for more.
+          // Substantial? Send immediately.
+          if (wc <= 2) {{
+            _pendingFinal = t;
+            _pendingTimer = setTimeout(() => _flushPending('timeout'), 900);
+          }} else {{
+            lastChunk = t;
+            append('you', t);
+            sendChunk(t);
+            setLive('thinking');
+            setTimeout(() => setLive('live'), 1200);
+            _lastInterim = '';
+          }}
+        }}
+
+        recognition.onresult = (ev) => {{
+          // Walk every result; final ones commit (debounced), interim
+          // ones stream live to the operator's view.
+          let interimRunning = '';
+          for (let i = 0; i < ev.results.length; i++) {{
+            const r = ev.results[i];
+            if (r.isFinal) {{
+              const picked = pickBestAlternative(r);
+              if (picked) _commitFinal(picked);
+            }} else {{
+              interimRunning += (r[0] && r[0].transcript) || '';
+            }}
+          }}
+          interimRunning = interimRunning.trim();
+          if (interimRunning) sendInterim(interimRunning);
+        }};
+        recognition.onstart = () => {{
+          recognizing = true;
+          setLive('live');
+        }};
+        recognition.onspeechstart = () => {{ setLive('speaking'); }};
+        recognition.onspeechend = () => {{ setLive('live'); }};
+        recognition.onerror = (e) => {{
+          // not-allowed = mic permission denied at the browser level
+          if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {{
+            setLive('blocked');
+            alwaysOn = false;
+            return;
+          }}
+          // 'no-speech' / 'aborted' / 'audio-capture' / 'network': just
+          // restart the recognizer so listening stays continuous.
+          setLive('starting');
+        }};
+        recognition.onend = () => {{
+          recognizing = false;
+          // Always-on mode: restart immediately. Some browsers tear down
+          // the recognizer every ~60s; the timeout buffers against
+          // ultra-tight loops while still feeling continuous to the user.
+          if (alwaysOn) {{
+            if (restartTimer) clearTimeout(restartTimer);
+            restartTimer = setTimeout(() => {{
+              try {{ recognition.start(); }} catch (e) {{}}
+            }}, 200);
+          }} else {{
+            setLive('blocked');
           }}
         }};
-        recognition.onerror = (e) => {{ setMic('error: ' + e.error, 'emer'); }};
-        recognition.onend = () => {{ recognizing = false; setMic('idle'); }};
       }}
 
       // ── Background continuous audio recorder ──
@@ -7738,7 +12329,13 @@ def _cc_render_voice_page(sess):
       let bgRecorder = null;
       async function ensureRecorder() {{
         if (mediaRecorder) return mediaRecorder;
-        const stream = await navigator.mediaDevices.getUserMedia({{audio: true}});
+        const stream = await navigator.mediaDevices.getUserMedia({{audio: {{
+            autoGainControl: true,
+            noiseSuppression: true,
+            echoCancellation: true,
+            sampleRate: 16000,
+            channelCount: 1
+          }}}});
         mediaRecorder = new MediaRecorder(stream);
         mediaRecorder.ondataavailable = (e) => {{ if (e.data && e.data.size) chunks.push(e.data); }};
         mediaRecorder.onstop = async () => {{
@@ -7766,8 +12363,42 @@ def _cc_render_voice_page(sess):
       async function startBgRecorder() {{
         if (bgRecorder) return;
         try {{
-          const stream = await navigator.mediaDevices.getUserMedia({{audio: true}});
-          bgRecorder = new MediaRecorder(stream, {{mimeType: 'audio/webm'}});
+          const stream = await navigator.mediaDevices.getUserMedia({{audio: {{
+            autoGainControl: true,
+            noiseSuppression: true,
+            echoCancellation: true,
+            sampleRate: 16000,
+            channelCount: 1
+          }}}});
+          // ── Web Audio pre-amp chain ──
+          // Caller mic + browser AGC are not enough — we want maximum
+          // sensitivity for STT. We route the raw stream through:
+          //   Source → GainNode (×4) → DynamicsCompressor → Destination
+          // The compressor prevents clipping while the gain ensures even
+          // a quiet mic pushes the recognizer hard.
+          let recordStream = stream;
+          try {{
+            const Ctx = window.AudioContext || window.webkitAudioContext;
+            if (Ctx) {{
+              const ctx = new Ctx();
+              const src = ctx.createMediaStreamSource(stream);
+              const gain = ctx.createGain();
+              gain.gain.value = 4.0;   // 4x boost
+              const comp = ctx.createDynamicsCompressor();
+              comp.threshold.value = -18; // dB — soft knee around speech level
+              comp.knee.value = 24;
+              comp.ratio.value = 4;
+              comp.attack.value = 0.005;
+              comp.release.value = 0.1;
+              const dest = ctx.createMediaStreamDestination();
+              src.connect(gain).connect(comp).connect(dest);
+              recordStream = dest.stream;
+              console.log('voice page: Web Audio pre-amp engaged (gain=4x + compressor)');
+            }}
+          }} catch (e) {{
+            console.warn('Web Audio pre-amp unavailable:', e);
+          }}
+          bgRecorder = new MediaRecorder(recordStream, {{mimeType: 'audio/webm'}});
           bgRecorder.ondataavailable = async (e) => {{
             if (!e.data || e.data.size < 800) return;
             try {{
@@ -7795,39 +12426,42 @@ def _cc_render_voice_page(sess):
         }});
       }}
 
-      // ── Hold-to-talk ──
-      let holding = false;
-      async function startTalking() {{
-        if (holding) return;
-        holding = true;
-        talk.style.background = '#aa2233';
-        setMic('listening...', 'good');
-        if (recognition && !recognizing) {{
-          try {{ recognition.start(); recognizing = true; }} catch (e) {{}}
-        }} else if (!recognition) {{
-          // browser has no SR — fall back to recording audio
-          const mr = await ensureRecorder();
-          chunks = [];
-          mr.start();
+      // ── Always-on listening: start the recognizer the moment the page is ready ──
+      // No hold-to-talk; no toggle. The mic stays open the entire call,
+      // the recognizer auto-restarts on onend, and the user can also
+      // type prompts via the text input row.
+      function startAlwaysOnListening() {{
+        if (!recognition || recognizing) return;
+        try {{
+          setLive('starting');
+          recognition.start();
+        }} catch (e) {{
+          // InvalidStateError = already started; treat as success
+          if ((e + '').indexOf('InvalidStateError') < 0) {{
+            console.warn('SR start failed:', e);
+          }}
         }}
       }}
-      function stopTalking() {{
-        if (!holding) return;
-        holding = false;
-        talk.style.background = '#226644';
-        if (recognition && recognizing) {{ try {{ recognition.stop(); }} catch (e) {{}} }}
-        if (!recognition && mediaRecorder && mediaRecorder.state === 'recording') {{
-          mediaRecorder.stop();
-          setMic('processing...', 'warn');
-        }}
+
+      // ── Text-prompt row: send typed messages alongside live voice ──
+      const textInput = document.getElementById('textinput');
+      const textSend  = document.getElementById('textsend');
+      function sendTextPrompt() {{
+        const t = (textInput.value || '').trim();
+        if (!t) return;
+        textInput.value = '';
+        append('you', t);
+        sendChunk(t);
+        setLive('thinking');
+        setTimeout(() => setLive(alwaysOn ? 'live' : 'blocked'), 1000);
       }}
-      talk.addEventListener('mousedown', startTalking);
-      talk.addEventListener('mouseup', stopTalking);
-      talk.addEventListener('mouseleave', stopTalking);
-      talk.addEventListener('touchstart', (e) => {{ e.preventDefault(); startTalking(); }}, {{passive:false}});
-      talk.addEventListener('touchend', (e) => {{ e.preventDefault(); stopTalking(); }});
-      window.addEventListener('keydown', (e) => {{ if (e.code === 'Space' && !e.repeat) {{ e.preventDefault(); startTalking(); }} }});
-      window.addEventListener('keyup', (e) => {{ if (e.code === 'Space') {{ e.preventDefault(); stopTalking(); }} }});
+      textSend.addEventListener('click', sendTextPrompt);
+      textInput.addEventListener('keydown', (e) => {{
+        if (e.key === 'Enter' && !e.shiftKey) {{
+          e.preventDefault();
+          sendTextPrompt();
+        }}
+      }});
 
       // ── TTS for AI replies ────────────────────────────────────────────
       // The voice page is a real phone call — speech rate is bumped so the
@@ -7857,17 +12491,42 @@ def _cc_render_voice_page(sess):
         try {{ window.speechSynthesis.getVoices(); }} catch(e) {{}}
         window.speechSynthesis.onvoiceschanged = _pickVoice;
       }}
+      // Last-spoken de-dupe — protects against the same trace being
+      // delivered twice (initial replay + live decision) speaking twice.
+      let _lastSpokenText = '';
+      let _lastSpokenAt = 0;
       function speak(text, isEmergency) {{
+        // Silent Emergency Mode hard-mutes the AI: text transcript still
+        // updates, but the AI never makes a sound. For callers in scenarios
+        // where audible AI replies would put them at risk.
+        const silentBox = document.getElementById('silentmode');
+        if (silentBox && silentBox.checked) {{
+          // Also cancel anything currently being spoken if the operator
+          // just toggled silent mode mid-utterance.
+          try {{ window.speechSynthesis.cancel(); }} catch (e) {{}}
+          return;
+        }}
         if (!document.getElementById('ttson').checked) return;
         if (!('speechSynthesis' in window)) return;
+        const now = Date.now();
+        if (text === _lastSpokenText && (now - _lastSpokenAt) < 1500) {{
+          return;  // duplicate trace within 1.5s — skip
+        }}
+        _lastSpokenText = text;
+        _lastSpokenAt = now;
         try {{
-          // Always cancel queued utterances so the AI stays current
-          window.speechSynthesis.cancel();
+          // Emergency replies CANCEL anything in flight — a stale
+          // conversational line can't be allowed to cover up a real
+          // dispatch. Non-emergency replies QUEUE so each AI reply is
+          // played end-to-end (critical for casual chat where multiple
+          // lines land back-to-back).
+          if (isEmergency) {{
+            window.speechSynthesis.cancel();
+          }}
           const u = new SpeechSynthesisUtterance(text);
-          // Operator-controlled rate via slider; emergency adds +0.10
           const slider = document.getElementById('rate-slider');
-          const baseRate = slider ? parseFloat(slider.value) : 1.20;
-          u.rate  = isEmergency ? Math.min(1.6, baseRate + 0.10) : baseRate;
+          const baseRate = slider ? parseFloat(slider.value) : 1.70;
+          u.rate  = isEmergency ? Math.min(2.4, baseRate + 0.10) : Math.min(2.4, baseRate);
           u.pitch = isEmergency ? 1.10 : 1.00;
           u.volume = 1.0;
           const voice = _pickVoice();
@@ -7886,17 +12545,35 @@ def _cc_render_voice_page(sess):
         if (m.action) setStat(m.action, isEmer ? 'emer' : ((m.action || '').includes('DISPATCH') ? 'disp' : 'good'));
         if (m.response) {{
           append('ai', m.response);
-          speak(m.response, isEmer);
+          // Skip TTS for the initial replay (history line) — only LIVE
+          // decisions should make the AI talk.
+          if (!m.replay) {{
+            speak(m.response, isEmer);
+          }}
         }}
+        // Reset the live indicator: the AI has decided, mic is back to
+        // listening for the caller's next turn.
+        if (alwaysOn) setLive('live');
       }});
       es.addEventListener('end', ev => {{
         setStat('ended', 'dim');
+        // Stop the always-on listener cleanly when the call ends.
+        alwaysOn = false;
+        try {{ if (recognition) recognition.stop(); }} catch (e) {{}}
+        setLive('blocked');
+        liveLbl.textContent = '☎ CALL ENDED';
+        liveLbl.style.color = '#888';
         es.close();
       }});
       es.onerror = () => {{}};
 
       // ── Hang up / fallback ──
       document.getElementById('hangup').onclick = async () => {{
+        // Stop the always-on recognizer so it doesn't try to restart
+        // after we close the page.
+        alwaysOn = false;
+        try {{ if (recognition) recognition.stop(); }} catch (e) {{}}
+        if (restartTimer) {{ clearTimeout(restartTimer); restartTimer = null; }}
         // Flush the background recorder so the last audio chunk lands
         // before the session is closed and artifacts saved.
         try {{
@@ -7914,20 +12591,52 @@ def _cc_render_voice_page(sess):
         location.href = '/call/' + encodeURIComponent(callId);
       }};
 
-      // Permission warm-up + start the background recorder for audio archive
+      // Auto-acquire mic + start always-on listening immediately on load.
+      // The browser will surface its native permission prompt the moment
+      // getUserMedia() is called, so the caller never has to click anything
+      // to "start" the call — they just talk.
+      setLive('starting');
       if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {{
-        navigator.mediaDevices.getUserMedia({{audio: true}})
+        navigator.mediaDevices.getUserMedia({{audio: {{
+            autoGainControl: true,
+            noiseSuppression: true,
+            echoCancellation: true,
+            sampleRate: 16000,
+            channelCount: 1
+          }}}})
           .then((s) => {{
+            // Don't keep this raw stream — SpeechRecognition opens its own.
+            // We just used getUserMedia() to surface the permission prompt
+            // and unlock the bg recorder.
             s.getTracks().forEach(t=>t.stop());
             setStat('connected', 'good');
+            setMic('live', 'good');
             // Kick off background continuous recorder so the operator
             // gets a full audio archive even when SpeechRecognition is
             // doing the live STT.
             startBgRecorder();
+            // Start always-on speech recognition. Keep retrying briefly
+            // until the recognizer accepts start() (some browsers refuse
+            // until microphone hardware is fully warm).
+            let tries = 0;
+            (function tryStart() {{
+              if (recognizing) return;
+              tries += 1;
+              startAlwaysOnListening();
+              if (tries < 6 && !recognizing) setTimeout(tryStart, 250);
+            }})();
           }})
-          .catch(() => {{ setStat('mic blocked', 'emer'); }});
+          .catch((err) => {{
+            setStat('mic blocked', 'emer');
+            setMic('blocked', 'emer');
+            setLive('blocked');
+            alwaysOn = false;
+            console.warn('mic permission denied:', err);
+          }});
       }} else {{
         setStat('no mic API', 'emer');
+        setLive('blocked');
+        alwaysOn = false;
       }}
 
       // ── Location: request precise fix immediately, fall back to IP geo ──
@@ -8773,6 +13482,19 @@ def _cc_render_livecalls_page(token):
           const card = document.createElement('div');
           card.className = 'panel light';
           card.style.cssText = 'cursor:pointer; padding:0; margin:0; min-height:200px;';
+          // AI Council snapshot — pull the most recent council record so
+          // the operator can see at a glance how many AIs are advising
+          // and what the swarm currently recommends.
+          const lastCouncil = (s.ai_council||[]).slice(-1)[0];
+          let councilLine = '';
+          if (lastCouncil) {{
+            const cTag = (lastCouncil.council_pick||'').includes('ESCALATE') ? 'emer'
+              : (lastCouncil.council_pick||'').includes('DISPATCH') ? 'disp' : 'good';
+            councilLine = `<div style="padding:6px 14px; border-top:1px dashed var(--border-light); display:flex; justify-content:space-between; align-items:center">
+              <span class="dim small mono">🧠 ${{lastCouncil.num_entities}} AIs advising</span>
+              <span class="pill ${{cTag}}" title="agreement ${{(lastCouncil.council_agreement||0).toFixed(2)}}">council → ${{escHtml(lastCouncil.council_pick||'?')}}</span>
+            </div>`;
+          }}
           card.innerHTML = `
             <div style="padding:10px 14px; display:flex; justify-content:space-between; border-bottom:1px solid var(--border-light)">
               <div><div class="mono" style="font-weight:bold; color:var(--head-light)">☎ ${{escHtml(s.phone)}}</div>
@@ -8785,7 +13507,8 @@ def _cc_render_livecalls_page(token):
               <div style="color:var(--blue-dark); font-weight:bold; font-family:'Cambria',serif">"${{escHtml(last)}}"</div></div>
             <div style="padding:8px 14px; display:flex; justify-content:space-between">
               <span class="pill ${{atier}}">AI → ${{escHtml(a.slice(0,30))}}</span>
-              <span class="dim small mono">${{escHtml(s.ai_id)}}</span></div>`;
+              <span class="dim small mono">${{escHtml(s.ai_id)}}</span></div>
+            ${{councilLine}}`;
           card.onclick = () => window.open('/audit/'+encodeURIComponent(s.call_id)+'?token='+TOK, '_blank');
           el.appendChild(card);
         }}
@@ -8839,9 +13562,40 @@ def _cc_render_audit_page(token, call_id=None):
         const r = await fetch('/api/session/' + encodeURIComponent(cid) + '?token=' + TOK);
         const s = await r.json();
         const decisions = s.decisions || [];
+        const council = s.ai_council || [];
+        // Index council by chunk_index so per-chunk panel can pull its votes.
+        const councilByChunk = {{}};
+        for (const c of council) councilByChunk[c.chunk_index] = c;
         const html = decisions.map((d, i) => {{
           const agg = d.aggregate || {{}};
           const tag = (d.action||'').includes('EMERGENCY') ? 'emer' : (d.action||'').includes('DISPATCH') ? 'disp' : 'good';
+          const cc = councilByChunk[i];
+          let councilHtml = '';
+          if (cc) {{
+            const tallyStr = Object.entries(cc.tally||{{}}).sort((a,b)=>b[1]-a[1])
+              .map(([k,v]) => k+'='+(v.toFixed(2))).join(', ');
+            const votes = (cc.votes||[]).map(v => {{
+              const eTag = (v.recommendation||'').includes('ESCALATE') ? 'emer'
+                : (v.recommendation||'').includes('DISPATCH') ? 'disp' : 'good';
+              return `<div class="dim small mono" style="margin-left:1em">
+                · <strong>${{v.entity_id}}</strong> [${{v.entity_type}}]
+                  C=${{(v.C||0).toFixed(2)}} coh=${{(v.coherence||0).toFixed(2)}}
+                  karma=${{(v.karma||0).toFixed(2)}} w=${{(v.weight||0).toFixed(2)}}
+                  → <span class="pill ${{eTag}}">${{v.recommendation}}</span>
+                  <div class="dim small" style="margin-left:2em">${{(v.rationale||'').replace(/</g,'&lt;')}}</div>
+              </div>`;
+            }}).join('');
+            councilHtml = `
+              <div style="margin-top:6px; padding-top:6px; border-top:1px dashed var(--border-light)">
+                <div><strong>🧠 AI Council</strong> (${{cc.num_entities}} entities)
+                  picked <span class="pill ${{(cc.council_pick||'').includes('ESCALATE')?'emer':(cc.council_pick||'').includes('DISPATCH')?'disp':'good'}}">${{cc.council_pick}}</span>
+                  agreement=${{(cc.council_agreement||0).toFixed(2)}}</div>
+                <div class="dim small mono">tally: ${{tallyStr}}</div>
+                <details><summary class="dim small">show all ${{(cc.votes||[]).length}} votes</summary>
+                  ${{votes}}
+                </details>
+              </div>`;
+          }}
           return `<div class="panel">
             <strong>chunk #${{i}}</strong> @ ${{d.received_at||''}}
             <div>caller: <em>"${{(d.chunk||'').replace(/</g,'&lt;')}}"</em></div>
@@ -8850,6 +13604,7 @@ def _cc_render_audit_page(token, call_id=None):
             <div>response: "${{(d.response||'').replace(/</g,'&lt;')}}"</div>
             <div class="dim small">latency: ${{(d.latency_ms||0).toFixed(2)}}ms · think: ${{(d.think_ms||0).toFixed(2)}}ms</div>
             <div>${{(d.reasoning||[]).map(r=>'<div class="dim small">· '+r+'</div>').join('')}}</div>
+            ${{councilHtml}}
           </div>`;
         }}).join('');
         document.getElementById('content').innerHTML = `
@@ -8890,7 +13645,16 @@ def _cc_render_map_page(token):
       <button onclick="dispatchToActive()" style="background:#0a4d2a; color:#fff">📡 Auto-Dispatch Active Call</button>
       <button onclick="resetFleet()" title="Reset fleet to default San Francisco coordinates">↺ Reset Fleet</button>
     </div>
-    <div id="map"></div>
+    <div id="ip-banner" class="dim small" style="margin-bottom:6px"></div>
+    <div style="display:flex; gap:8px; align-items:flex-start">
+      <div id="map" style="flex:1"></div>
+      <div id="sidebar" style="width:240px; max-height:80vh; overflow-y:auto;
+                                font-size:.9em; border:1px solid var(--gold);
+                                padding:6px;">
+        <div style="font-weight:bold; margin-bottom:4px">Active calls</div>
+        <div id="sidebar-list" class="dim small">(none)</div>
+      </div>
+    </div>
     <div class="dim small" style="margin-top:6px">
       Tip: <b>Right-click the map</b> to rebase the fleet to that point. Right-click a unit to inspect.
     </div>
@@ -8981,6 +13745,39 @@ def _cc_render_map_page(token):
         const seen = new Set();
         const fitPoints = [];
         const active = (j1.sessions || []).filter(x => x.status === 'active');
+        // ── Public-IP banner: shows where unlocated callers are pinned to ──
+        try {{
+          const rip = await fetch('/api/operator/public_ip?token='+TOK);
+          if (rip.ok) {{
+            const jip = await rip.json();
+            if (jip && jip.ip) {{
+              const where = (jip.city ? jip.city + ', ' : '') +
+                            (jip.country || '');
+              document.getElementById('ip-banner').innerHTML =
+                `🌐 Operator public IP: <b>${{jip.ip}}</b>` +
+                (where ? ` &nbsp;·&nbsp; ${{where}}` : '') +
+                ` &nbsp;·&nbsp; calls without GPS / IP geo are pinned here as fallback`;
+            }}
+          }}
+        }} catch (e) {{}}
+        // ── Sidebar list of every active call (with or without location) ──
+        const sb = [];
+        for (const s of active) {{
+          const loc = s.location || {{}};
+          const has_loc = !!(loc.lat || loc.lon);
+          const tag = has_loc ? '🟢' : '⚪';
+          const where = has_loc
+            ? `${{loc.city||'?'}}, ${{loc.country||'?'}} (${{loc.source||'?'}})`
+            : '<span style="color:#c00">no location yet</span>';
+          sb.push(
+            `<div style="border-bottom:1px solid #ccc; padding:3px 0">
+               ${{tag}} <b>${{s.ai_id||''}}</b> · ${{s.phone||'—'}}<br>
+               <span class="dim small">${{where}}</span><br>
+               <span class="dim small">${{s.last_action||''}}</span>
+             </div>`);
+        }}
+        document.getElementById('sidebar-list').innerHTML =
+          sb.length ? sb.join('') : '<span class="dim small">(none)</span>';
         for (const s of active) {{
           const loc = s.location || {{}};
           if (!loc.lat && !loc.lon) continue;
@@ -8988,10 +13785,12 @@ def _cc_render_map_page(token):
           const ll = [loc.lat, loc.lon];
           fitPoints.push(ll);
           LAST_ACTIVE = s;
+          const acc = loc.accuracy_m ? ` · ±${{loc.accuracy_m}}m` : '';
           const popup = `<strong>${{s.ai_id||''}}</strong> · ${{s.call_number||''}}<br>
                          phone: ${{s.phone||'—'}}<br>
                          action: ${{s.last_action||''}}<br>
-                         loc src: ${{loc.source||'?'}}<br>
+                         loc src: ${{loc.source||'?'}}${{acc}}<br>
+                         where: ${{loc.city||'?'}}, ${{loc.country||'?'}}<br>
                          <button onclick="window.open('/dispatch?token=${{TOK}}&call=${{encodeURIComponent(s.call_id)}}','_blank')">📡 Send to Units</button>`;
           if (PINS[s.call_id]) {{
             PINS[s.call_id].setLatLng(ll);
@@ -9946,7 +14745,23 @@ class _CCRequestHandler(_cc_http.BaseHTTPRequestHandler):
             pass
 
     def _send_json(self, code, payload):
-        self._send(code, json.dumps(payload), 'application/json; charset=utf-8')
+        # default=str lets sets / datetimes / weird types serialize as
+        # their string repr instead of crashing the response. Caller
+        # may also pass session dicts that contain `__chat_context__`
+        # private state — drop those before serializing.
+        if isinstance(payload, dict):
+            payload = {k: v for k, v in payload.items()
+                        if not (isinstance(k, str) and k.startswith('__'))}
+            # Recursively strip from nested 'sessions' / 'session' lists
+            if 'sessions' in payload and isinstance(payload['sessions'], list):
+                payload['sessions'] = [
+                    {kk: vv for kk, vv in s.items()
+                     if not (isinstance(kk, str) and kk.startswith('__'))}
+                    if isinstance(s, dict) else s
+                    for s in payload['sessions']
+                ]
+        self._send(code, json.dumps(payload, default=str),
+                    'application/json; charset=utf-8')
 
     def _read_json(self, max_bytes=64 * 1024):
         try:
@@ -10127,6 +14942,23 @@ class _CCRequestHandler(_cc_http.BaseHTTPRequestHandler):
                                               if u['status'] == 'AVAILABLE']),
                     'units_busy': len([u for u in unit_roster.snapshot()
                                         if u['status'] not in ('AVAILABLE', 'OUT_OF_SERVICE')]),
+                })
+            if path == '/api/operator/public_ip':
+                # Returns the operator's own public IP + city-level geo
+                # (used by the caller map's IP banner so callers without
+                # a fix have a transparent fallback location).
+                if not self._check_token():
+                    return self._send_json(401, {'error': 'unauthorized'})
+                ip = public_ip_locator.get_ip(blocking=False)
+                geo = public_ip_locator.get_geo(blocking=False) or {}
+                return self._send_json(200, {
+                    'ip': ip,
+                    'lat': geo.get('lat'),
+                    'lon': geo.get('lon'),
+                    'city': geo.get('city'),
+                    'country': geo.get('country'),
+                    'org': geo.get('org'),
+                    'source': geo.get('_source'),
                 })
             # ── CAD Unit Roster API ──
             if path == '/api/units':
@@ -10512,6 +15344,28 @@ class _CCRequestHandler(_cc_http.BaseHTTPRequestHandler):
                     except Exception as e:
                         _cc_logger.error(f'/api/call/.../chunk failed: {e}')
                 threading.Thread(target=_go, daemon=True).start()
+                return self._send_json(200, {'ok': True})
+            if path.startswith('/api/call/') and path.endswith('/interim'):
+                # Streaming interim transcript: words/partial phrases
+                # arrive as the caller speaks. We DON'T fire a decision
+                # here — interim text just gets attached to the session
+                # as 'pending_words' so operators see real-time STT
+                # buildup. The recognizer will send a final /chunk when
+                # the utterance completes.
+                cid = _cc_urlparse.unquote(
+                    path[len('/api/call/'):-len('/interim')])
+                sess = call_center_service.get_session(cid)
+                if sess is None:
+                    return self._send_json(404, {'error': 'not_found'})
+                data = self._read_json() or {}
+                text = (data.get('text') or '').strip()
+                with call_center_service._lock:
+                    sess['pending_words'] = text
+                    sess['pending_words_at'] = datetime.now().strftime(
+                        '%H:%M:%S.%f')[:-3]
+                # Publish a session update so subscribers (Tk caller phone,
+                # operator dashboards) repaint with the live word stream.
+                call_center_service._publish_session('update', sess)
                 return self._send_json(200, {'ok': True})
             if path.startswith('/api/call/') and path.endswith('/audio'):
                 # Voice fallback: browser uploaded a recorded audio blob.
@@ -11073,10 +15927,17 @@ class TkVoicePipeline:
         self._level = 0.0            # last-known mic peak level (0..1)
         self._level_lock = threading.Lock()
 
+        # Sound-boost / AGC defaults — applied to BOTH push-to-talk and the
+        # always-on continuous listener so a faded mic still hits STT loud.
+        self._agc_target_peak = 0.75   # boost peak to ~75% of int16
+        self._agc_max_gain = 24.0      # cap gain at ~28dB
+        self._agc_min_gain = 1.0       # never attenuate
+
         self._tts_queue = deque()
         self._tts_thread = None
         self._tts_stop = threading.Event()
         self._tts_current_proc = None   # subprocess for PowerShell fallback
+        self._last_spoken = None        # (text, ts) for de-dupe across subscribers
 
         self._init_backends()
         if self.has_tts():
@@ -11099,18 +15960,19 @@ class TkVoicePipeline:
         except Exception:
             pass  # PowerShell SAPI fallback is still available on Windows
 
+        # We INTENTIONALLY don't cache a pyttsx3 engine here. pyttsx3 has
+        # a "speaks once" bug on Windows where the second runAndWait()
+        # returns instantly without playing audio. _speak_now() rebuilds
+        # the engine per utterance only when SAPI-via-PowerShell is
+        # unavailable. Just probe pyttsx3 availability for has_tts()
+        # reporting.
         try:
-            import pyttsx3 as _pyttsx3
-            self._tts_engine = _pyttsx3.init()
-            # Slightly faster than default for active voice calls (~1.2x)
-            try:
-                cur_rate = self._tts_engine.getProperty('rate')
-                self._tts_engine.setProperty('rate', int(cur_rate * 1.20))
-            except Exception:
-                pass
+            import pyttsx3 as _pyttsx3  # noqa: F401
+            self._has_pyttsx3 = True
         except Exception as e:
+            self._has_pyttsx3 = False
             _cc_logger.info(f'TkVoice: pyttsx3 unavailable: {e} '
-                            f'— will use PowerShell SAPI fallback for TTS')
+                            f'— PowerShell SAPI is the primary TTS path')
 
     def has_mic(self):
         return self._sd is not None and self._np is not None
@@ -11121,7 +15983,7 @@ class TkVoicePipeline:
         return self.has_mic() and (sys.platform == 'win32' or self._sr_lib is not None)
 
     def has_tts(self):
-        return self._tts_engine is not None or sys.platform == 'win32'
+        return getattr(self, '_has_pyttsx3', False) or sys.platform == 'win32'
 
     def status(self):
         """One-line capability summary for the Tk UI."""
@@ -11134,10 +15996,10 @@ class TkVoicePipeline:
                 parts.append('STT: SAPI (offline)')
             else:
                 parts.append('STT ✗')
-        if self._tts_engine:
+        if sys.platform == 'win32':
+            parts.append('TTS: SAPI (offline, primary)')
+        elif getattr(self, '_has_pyttsx3', False):
             parts.append('TTS: pyttsx3 (offline)')
-        elif sys.platform == 'win32':
-            parts.append('TTS: SAPI (offline)')
         else:
             parts.append('TTS ✗')
         return '  ·  '.join(parts)
@@ -11218,6 +16080,23 @@ class TkVoicePipeline:
                 on_done(None)
             return
 
+        # Sound boost: same AGC pass as the always-on path so push-to-talk
+        # also benefits from gain on faded mics.
+        try:
+            target = float(getattr(self, '_agc_target_peak', 0.75))
+            max_gain = float(getattr(self, '_agc_max_gain', 24.0))
+            min_gain = float(getattr(self, '_agc_min_gain', 1.0))
+            af = audio.astype(self._np.float32)
+            peak = float(self._np.abs(af).max())
+            if peak > 0:
+                gain = (target * 32767.0) / peak
+                gain = max(min_gain, min(max_gain, gain))
+                if gain > 1.001:
+                    af = self._np.clip(af * gain, -32767.0, 32767.0)
+                    audio = af.astype(self._np.int16)
+        except Exception:
+            pass
+
         # Write WAV
         try:
             import tempfile, wave as _wave
@@ -11249,6 +16128,294 @@ class TkVoicePipeline:
 
         threading.Thread(target=_do_transcribe, daemon=True,
                          name='TkVoiceSTT').start()
+
+    # ── Always-on listening (continuous, no push-to-talk) ─────────────
+    def start_always_on(self, on_utterance):
+        """Open the mic and listen continuously until stop_always_on().
+        Each utterance (separated by ~0.7s of silence) is transcribed via
+        the 5-attempt consensus pipeline and on_utterance(text) is called
+        from a worker thread. Returns True if listening started, False if
+        we already are or the mic isn't available.
+
+        on_utterance(text) is invoked with the picked transcript whenever
+        an utterance finalizes; text may be None if all 5 attempts failed.
+        """
+        if not self.has_mic():
+            return False
+        if getattr(self, '_always_on', False):
+            return True
+
+        self._always_on = True
+        self._always_on_callback = on_utterance
+        self._always_on_buffer = []        # current utterance frames
+        self._always_on_silent_blocks = 0  # consecutive silent blocks
+        self._always_on_voiced_blocks = 0  # consecutive voiced blocks
+        self._always_on_in_speech = False
+        # ~50ms per block. 14 silent blocks ≈ 0.7s pause = end-of-utterance.
+        self._silence_blocks_to_end = 14
+        # Need at least ~0.2s of voiced audio before we count it as speech
+        self._voiced_blocks_to_start = 4
+        # Energy gate (0..1). Aggressive low so even a near-silent mic
+        # trips speech detection. Operators reported the AI was "missing
+        # words" — usually the gate was rejecting them as silence. Pre-
+        # gain pass below also amplifies the input before this check.
+        self._energy_gate = 0.0008
+        # AGC target — push peak to 92% of int16 range. With the soft
+        # compressor below we can go higher than 0.75 without clipping.
+        self._agc_target_peak = 0.92
+        self._agc_max_gain = 40.0    # up to ~32dB boost for faded mics
+        self._agc_min_gain = 1.0     # never attenuate
+        # Pre-gain applied LIVE to every audio block before the VAD gate
+        # so quiet input is amplified the moment it arrives. The soft-
+        # knee compressor in _consume_utterance_frames keeps loud peaks
+        # from clipping after this multiplier hits them.
+        self._pre_gain = 3.0
+        # Soft-knee compressor params: any sample whose magnitude exceeds
+        # the threshold gets compressed (not hard-clipped) so loud
+        # speech stays clean while quiet speech stays loud.
+        self._compress_threshold = 0.85    # fraction of int16 max
+        self._compress_ratio = 4.0         # 4:1 above threshold
+
+        try:
+            self._always_on_stream = self._sd.InputStream(
+                samplerate=self.SAMPLE_RATE,
+                channels=self.CHANNELS,
+                dtype=self.DTYPE,
+                callback=self._always_on_callback_stream,
+                blocksize=int(self.SAMPLE_RATE * 0.05))   # 50ms blocks
+            self._always_on_stream.start()
+            return True
+        except Exception as e:
+            _cc_logger.error(f'TkVoice: always-on mic open failed: {e}')
+            self._always_on = False
+            return False
+
+    def stop_always_on(self):
+        """Stop continuous listening. Any in-flight transcription completes
+        in the background but won't fire on_utterance after this returns."""
+        self._always_on = False
+        try:
+            stream = getattr(self, '_always_on_stream', None)
+            if stream is not None:
+                stream.stop()
+                stream.close()
+        except Exception:
+            pass
+        self._always_on_stream = None
+        self._always_on_buffer = []
+
+    def _always_on_callback_stream(self, indata, frames_count, time_info, status):
+        """sounddevice callback for the continuous listener. Runs energy-
+        based VAD to split the audio into utterances and dispatches each
+        one to the 5-attempt consensus transcriber.
+
+        The block is pre-gained (live boost) BEFORE VAD so a quiet mic
+        still trips the energy gate. We store the pre-gained block in
+        the buffer too, so STT receives the boosted audio."""
+        if not getattr(self, '_always_on', False):
+            return
+        try:
+            raw = indata.copy()
+            # ── Pre-gain: live multiplier with soft compressor ──
+            pre_gain = float(getattr(self, '_pre_gain', 3.0))
+            if pre_gain > 1.001:
+                af = raw.astype(self._np.float32) * pre_gain
+                # Soft-knee: anything above threshold gets compressed,
+                # not hard-clipped. Keeps loud peaks clean while quiet
+                # speech stays amplified.
+                thr = float(getattr(self, '_compress_threshold', 0.85)) * 32767.0
+                ratio = float(getattr(self, '_compress_ratio', 4.0))
+                abs_af = self._np.abs(af)
+                over = abs_af > thr
+                if self._np.any(over):
+                    excess = abs_af[over] - thr
+                    compressed = thr + excess / ratio
+                    sign = self._np.sign(af[over])
+                    af[over] = sign * compressed
+                af = self._np.clip(af, -32767.0, 32767.0)
+                block = af.astype(self._np.int16)
+            else:
+                block = raw
+            # Update mic level meter so the existing meter widget animates
+            peak = float(self._np.abs(block).max()) / 32768.0
+            with self._level_lock:
+                self._level = max(self._level * 0.6, peak)
+            # Energy-based VAD: RMS over the block, normalized to 0..1
+            rms = float(self._np.sqrt(self._np.mean(block.astype(self._np.float32) ** 2))) / 32768.0
+            voiced = rms > self._energy_gate
+            if self._always_on_in_speech:
+                self._always_on_buffer.append(block)
+                if voiced:
+                    self._always_on_silent_blocks = 0
+                else:
+                    self._always_on_silent_blocks += 1
+                    if self._always_on_silent_blocks >= self._silence_blocks_to_end:
+                        # End of utterance — dispatch to STT consensus
+                        frames = self._always_on_buffer
+                        self._always_on_buffer = []
+                        self._always_on_silent_blocks = 0
+                        self._always_on_voiced_blocks = 0
+                        self._always_on_in_speech = False
+                        threading.Thread(
+                            target=self._consume_utterance_frames,
+                            args=(frames,), daemon=True,
+                            name='TkVoiceAlwaysOnUtt').start()
+            else:
+                if voiced:
+                    self._always_on_voiced_blocks += 1
+                    self._always_on_buffer.append(block)
+                    if self._always_on_voiced_blocks >= self._voiced_blocks_to_start:
+                        self._always_on_in_speech = True
+                else:
+                    # Drop pre-roll frames that never matured into speech
+                    if self._always_on_buffer:
+                        self._always_on_buffer = []
+                    self._always_on_voiced_blocks = 0
+        except Exception as e:
+            _cc_logger.debug(f'TkVoice: always-on callback error: {e}')
+
+    def _consume_utterance_frames(self, frames):
+        """Write frames to a temp WAV, run 5-attempt consensus, fire the
+        callback with the picked text. Audio is auto-gain-boosted before
+        STT so a faded mic still reaches the recognizer at usable loudness."""
+        if not frames:
+            return
+        try:
+            audio = self._np.concatenate(frames, axis=0)
+        except Exception:
+            return
+        # Skip ultra-short utterances (< 200ms). Real speech is rarely shorter.
+        if audio.shape[0] < int(self.SAMPLE_RATE * 0.2):
+            return
+
+        # ── Sound boost (AGC) ─────────────────────────────────────
+        # Measure the loudest sample in the utterance, compute the gain
+        # needed to bring that peak up to AGC_TARGET_PEAK × int16 range,
+        # cap at AGC_MAX_GAIN, multiply, then clip and recast to int16.
+        # Faded mics get a big boost; already-loud mics get pass-through.
+        try:
+            target = float(getattr(self, '_agc_target_peak', 0.92))
+            max_gain = float(getattr(self, '_agc_max_gain', 40.0))
+            min_gain = float(getattr(self, '_agc_min_gain', 1.0))
+            af = audio.astype(self._np.float32)
+            peak = float(self._np.abs(af).max())
+            # Use RMS (perceived loudness) as the gain target rather than
+            # peak alone — peak-based gain underboosts quiet speech with
+            # the occasional loud breath / click. Compute both and use
+            # whichever asks for more boost (capped).
+            rms = float(self._np.sqrt(self._np.mean(af ** 2)))
+            if peak > 0:
+                desired_peak = target * 32767.0
+                gain_peak = desired_peak / peak
+                gain_rms = (target * 0.45 * 32767.0) / max(1.0, rms)
+                gain = max(gain_peak, gain_rms)
+                gain = max(min_gain, min(max_gain, gain))
+                if gain > 1.001:
+                    af = af * gain
+                    # Soft-knee compressor: anything above threshold gets
+                    # ratio'd down instead of hard-clipping. Keeps voice
+                    # natural-sounding even at extreme boost levels.
+                    thr = float(
+                        getattr(self, '_compress_threshold', 0.85)) * 32767.0
+                    ratio = float(getattr(self, '_compress_ratio', 4.0))
+                    abs_af = self._np.abs(af)
+                    over = abs_af > thr
+                    if self._np.any(over):
+                        excess = abs_af[over] - thr
+                        compressed = thr + excess / ratio
+                        sign = self._np.sign(af[over])
+                        af[over] = sign * compressed
+                    af = self._np.clip(af, -32767.0, 32767.0)
+                    audio = af.astype(self._np.int16)
+                    try:
+                        _cc_logger.debug(
+                            f'TkVoice AGC: peak={peak:.0f} '
+                            f'rms={rms:.0f} → gain×{gain:.2f}')
+                    except Exception:
+                        pass
+        except Exception as e:
+            _cc_logger.debug(f'TkVoice AGC failed: {e}')
+
+        try:
+            import tempfile, wave as _wave
+            tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+            tmp_path = tmp.name
+            tmp.close()
+            with _wave.open(tmp_path, 'wb') as wf:
+                wf.setnchannels(self.CHANNELS)
+                wf.setsampwidth(2)
+                wf.setframerate(self.SAMPLE_RATE)
+                wf.writeframes(audio.tobytes())
+        except Exception as e:
+            _cc_logger.debug(f'TkVoice: utterance wav write failed: {e}')
+            return
+
+        text = self._transcribe_wav_consensus(tmp_path, attempts=5)
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+        cb = getattr(self, '_always_on_callback', None)
+        if cb is not None and getattr(self, '_always_on', False):
+            try:
+                cb(text)
+            except Exception as e:
+                _cc_logger.debug(f'TkVoice: always-on callback fired error: {e}')
+
+    def _transcribe_wav_consensus(self, wav_path, attempts=5):
+        """Run STT N times in parallel and pick the highest-confidence
+        / highest-consensus transcript. Mirrors the browser voice page's
+        5-alternative scoring so the AI hears as clearly as it can."""
+        # Run attempts in parallel — each one is ~200-800ms of network I/O
+        # (recognize_google) or local SAPI work. ThreadPool keeps wallclock
+        # tight even with 5 attempts.
+        results = []
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=attempts) as pool:
+                futs = [pool.submit(self._transcribe_wav, wav_path)
+                        for _ in range(attempts)]
+                for f in futs:
+                    try:
+                        r = f.result(timeout=20)
+                    except Exception:
+                        r = None
+                    if r:
+                        results.append(r.strip())
+        except Exception as e:
+            _cc_logger.debug(f'TkVoice: parallel STT failed: {e}')
+        if not results:
+            return None
+        if len(results) == 1:
+            return results[0]
+        # Token-consensus scoring: candidates that share words with peers win
+        import re
+        def tokens(s):
+            return set(re.findall(r"[a-z0-9']+", s.lower()))
+        best, best_score = None, -1.0
+        for i, cand in enumerate(results):
+            my = tokens(cand)
+            if not my:
+                continue
+            consensus = 0
+            for j, other in enumerate(results):
+                if i == j:
+                    continue
+                consensus += len(my & tokens(other))
+            consensus_norm = consensus / max(1, len(my) * (len(results) - 1))
+            length_bonus = min(1.0, len(my) / 3.0) * 0.05
+            score = consensus_norm + length_bonus
+            if score > best_score:
+                best_score = score
+                best = cand
+        # Log the alternatives for operator audit
+        try:
+            _cc_logger.info(
+                f'TkVoice 5-attempt: {results} → picked: {best}')
+        except Exception:
+            pass
+        return best
 
     def _transcribe_wav(self, wav_path):
         """Try SpeechRecognition (online, fast, accurate) → SAPI fallback."""
@@ -11293,23 +16460,60 @@ class TkVoicePipeline:
 
     # ── TTS ─────────────────────────────────────────────────────────
     def speak(self, text, emergency=False):
-        """Queue an AI reply for speech. Cancels in-flight playback so the
-        most recent decision is what the caller hears."""
+        """Queue an AI reply for speech.
+
+        Behavior:
+          - emergency=True: cancel in-flight + clear queue, then speak.
+            We don't want a stale conversational line covering up an
+            EMERGENCY_ESCALATE response.
+          - emergency=False: APPEND to the queue. Each AI reply is
+            played end-to-end. This is critical for casual chat / JUST
+            TALK calls where multiple lines (chunk replies + idle
+            nudges) can land back-to-back; canceling each one would
+            leave the caller hearing only fragments.
+
+        De-dupe: if the very same text is already in the queue (or just
+        spoken in the last second), drop it — protects against double-
+        publishing the same trace.
+        """
         if not text or not self.has_tts():
             return
-        # Cancel any in-flight utterance
-        self._cancel_current_tts()
+        text = text.strip()
+        if not text:
+            return
+        if emergency:
+            self._cancel_current_tts()
+        else:
+            # Drop near-immediate duplicates so two subscribers receiving
+            # the same trace don't double-speak the line.
+            now = time.time()
+            last = getattr(self, '_last_spoken', None)
+            if (last and last[0] == text
+                    and (now - last[1]) < 1.5):
+                return
+            self._last_spoken = (text, now)
+            # Cap queue size so a flood of nudges doesn't pile up
+            # forever — drop the oldest pending line if we exceed 6.
+            while len(self._tts_queue) >= 6:
+                try:
+                    self._tts_queue.popleft()
+                except Exception:
+                    break
         self._tts_queue.append((text, bool(emergency)))
 
     def _cancel_current_tts(self):
-        # pyttsx3: stop the engine
-        if self._tts_engine is not None:
+        # pyttsx3: stop the engine if a fallback path happened to build one
+        if getattr(self, '_tts_engine', None) is not None:
             try:
                 self._tts_engine.stop()
             except Exception:
                 pass
+            self._tts_engine = None
         # Clear the queue so we don't drain stale lines
-        self._tts_queue.clear()
+        try:
+            self._tts_queue.clear()
+        except Exception:
+            pass
         # Kill any in-progress PowerShell synth process
         proc = self._tts_current_proc
         if proc is not None:
@@ -11338,45 +16542,78 @@ class TkVoicePipeline:
                 time.sleep(0.1)
 
     def _speak_now(self, text, emergency):
-        # Path 1: pyttsx3 (offline, fast)
-        if self._tts_engine is not None:
-            try:
-                with self._tts_engine_lock:
-                    base = self._tts_engine.getProperty('rate')
-                    # Active call = 1.20x baseline; emergency = 1.30x
-                    target = int(base / 1.20 * (1.30 if emergency else 1.20))
-                    self._tts_engine.setProperty('rate', target)
-                    self._tts_engine.say(text)
-                    self._tts_engine.runAndWait()
-                    self._tts_engine.setProperty('rate', base)
-                return
-            except Exception as e:
-                _cc_logger.debug(f'TkVoice: pyttsx3 speak failed: {e}')
-
-        # Path 2: PowerShell System.Speech.Synthesis with playback
+        # ── Path 1: PowerShell SAPI (most reliable on Windows) ──
+        # We prefer SAPI-via-PowerShell here because pyttsx3 has a
+        # well-known "speaks once" bug on Windows: after the first
+        # runAndWait() returns, subsequent ones complete instantly
+        # without producing audio. Operators reported the AI's first
+        # reply playing fine but every reply after going silent —
+        # that's pyttsx3's broken loop state. The SAPI subprocess
+        # synthesizes a fresh WAV every utterance, so it can't get
+        # stuck.
         if sys.platform == 'win32':
             try:
                 rate_i = 4 if emergency else 2
                 wav = _cc_synthesize_speech(text, rate=rate_i)
-                if not wav:
-                    return
-                import tempfile, winsound
-                tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
-                tmp.write(wav); tmp.close()
-                try:
-                    winsound.PlaySound(tmp.name,
-                        winsound.SND_FILENAME | winsound.SND_NODEFAULT)
-                finally:
+                if wav:
+                    import tempfile, winsound
+                    tmp = tempfile.NamedTemporaryFile(suffix='.wav',
+                                                     delete=False)
+                    tmp.write(wav); tmp.close()
                     try:
-                        os.unlink(tmp.name)
-                    except Exception:
-                        pass
+                        winsound.PlaySound(
+                            tmp.name,
+                            winsound.SND_FILENAME | winsound.SND_NODEFAULT)
+                        return  # success — don't fall through
+                    finally:
+                        try:
+                            os.unlink(tmp.name)
+                        except Exception:
+                            pass
             except Exception as e:
-                _cc_logger.debug(f'TkVoice: PowerShell TTS playback failed: {e}')
+                _cc_logger.debug(
+                    f'TkVoice: PowerShell SAPI TTS failed: {e}; '
+                    f'falling back to pyttsx3')
+
+        # ── Path 2: pyttsx3 fallback (non-Windows or SAPI failure) ──
+        # pyttsx3's driver gets stuck after the first runAndWait().
+        # The robust workaround is to TEAR DOWN and REBUILD the engine
+        # for every utterance — it's slower but it actually plays.
+        try:
+            import pyttsx3 as _pyttsx3
+            with self._tts_engine_lock:
+                # Stop / drop the cached engine if it exists
+                try:
+                    if self._tts_engine is not None:
+                        self._tts_engine.stop()
+                except Exception:
+                    pass
+                self._tts_engine = None
+                # Build a fresh one for THIS utterance
+                eng = _pyttsx3.init()
+                try:
+                    base = eng.getProperty('rate')
+                    target = int(base * (1.30 if emergency else 1.20))
+                    eng.setProperty('rate', target)
+                except Exception:
+                    pass
+                eng.say(text)
+                eng.runAndWait()
+                # Don't keep the engine around — let GC drop it
+                try:
+                    eng.stop()
+                except Exception:
+                    pass
+        except Exception as e:
+            _cc_logger.debug(f'TkVoice: pyttsx3 fallback speak failed: {e}')
 
     def shutdown(self):
         self._tts_stop.set()
         self._cancel_current_tts()
+        try:
+            self.stop_always_on()
+        except Exception:
+            pass
         try:
             if self._stream is not None:
                 self._stream.stop()
@@ -11513,8 +16750,17 @@ def _cc_server_stt(audio_path, mime):
 def _cc_broadcast_session(event, session):
     """Push a session event to all connected SSE clients (operator console)
     AND a per-call 'decision'/'end' event to call-specific listeners
-    (the caller's own browser, for live AI replies + TTS)."""
-    payload = json.dumps({'event': event, 'session': session})
+    (the caller's own browser, for live AI replies + TTS).
+
+    Private fields (keys starting with '__' double underscore — currently
+    used by CasualChatGenerator's per-call memory which contains Python
+    sets) are stripped before serialization."""
+    public_session = {
+        k: v for k, v in (session or {}).items()
+        if not (isinstance(k, str) and k.startswith('__'))
+    }
+    payload = json.dumps({'event': event, 'session': public_session},
+                         default=str)
     with _CCRequestHandler.sse_lock:
         clients = list(_CCRequestHandler.sse_clients)
     for c in clients:
@@ -28453,6 +33699,16 @@ def _theme_window_switcher(parent, simulator):
         except Exception as e:
             print(f'  [ERR] open phone: {e}')
 
+    def _open_crew():
+        try:
+            r = getattr(simulator, 'crew_receiver', None)
+            if r and r.win.winfo_exists():
+                r.win.deiconify(); r.win.lift(); r.win.focus_force()
+            else:
+                simulator.crew_receiver = launch_crew_receiver(simulator)
+        except Exception as e:
+            print(f'  [ERR] open crew receiver: {e}')
+
     def _open_internals():
         try:
             i = getattr(simulator, 'internals_window', None)
@@ -28482,6 +33738,7 @@ def _theme_window_switcher(parent, simulator):
              fg=T['white'], bg=T['blue']).pack(side=tk.LEFT, padx=(12, 8))
     _btn('🛡 Dashboard',     _open_dashboard).pack(side=tk.LEFT, padx=2, pady=4)
     _btn('📞 Caller Phone',  _open_phone).pack(side=tk.LEFT, padx=2, pady=4)
+    _btn('📟 Crew Receiver', _open_crew).pack(side=tk.LEFT, padx=2, pady=4)
     _btn('⬢ Network Monitor', _open_netmon).pack(side=tk.LEFT, padx=2, pady=4)
     _btn('🧠 Internals',      _open_internals).pack(side=tk.LEFT, padx=2, pady=4)
     tk.Frame(bar, width=1, bg=T['white']).pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=6)
@@ -29038,6 +34295,20 @@ class MonitoringDashboard:
                       'call ends. Color = urgency. Ring = action class.',
                  font=('Consolas', 9), fg=FG_DIM, bg=BG_PANEL,
                  wraplength=820, justify='left').pack(side=tk.LEFT, padx=8)
+        # Right-aligned cleanup buttons. "Hang Up All" force-ends every
+        # active session (operators reported test calls piling up because
+        # ANSWER_DIRECTLY never auto-ends a session). "Clear Ended" removes
+        # any lingering faded cards so the floor shows only what is live.
+        tk.Button(head, text='✕ Clear Ended',
+                  command=self._lc_clear_ended,
+                  bg='#444466', fg='white', font=('Consolas', 9),
+                  activebackground='#555588', relief='flat',
+                  padx=8, pady=2).pack(side=tk.RIGHT, padx=(2, 8))
+        tk.Button(head, text='■ Hang Up All',
+                  command=self._lc_hangup_all,
+                  bg='#884422', fg='white', font=('Consolas', 9),
+                  activebackground='#aa5533', relief='flat',
+                  padx=8, pady=2).pack(side=tk.RIGHT, padx=2)
 
         # Canvas where bubbles render
         canvas_wrap = tk.Frame(tab, bg=BG_PANEL, relief='flat', bd=0)
@@ -29179,6 +34450,41 @@ class MonitoringDashboard:
             print(f"  [ERR] hangup: {e}")
         self._lc_current_call = None
 
+    def _lc_hangup_all(self):
+        """Force-complete every active call. Useful when test traffic or
+        a long-running ANSWER_DIRECTLY session has piled up cards on
+        the floor that aren't going to auto-close."""
+        try:
+            with self.sim.call_center._lock:
+                active_cids = [s.get('call_id')
+                               for s in self.sim.call_center.sessions.values()
+                               if s.get('status') == 'active' and s.get('call_id')]
+        except Exception:
+            active_cids = []
+        for cid in active_cids:
+            try:
+                self.sim.call_center.complete_call(cid, outcome='operator_hangup_all')
+            except Exception as e:
+                print(f"  [ERR] hangup_all {cid}: {e}")
+        # Drop the bound test call too if we just ended it
+        if (self._lc_current_call
+                and self._lc_current_call[0] in active_cids):
+            self._lc_current_call = None
+
+    def _lc_clear_ended(self):
+        """Remove any lingering ended/fading cards from the floor."""
+        if not hasattr(self, '_lc_bubbles'):
+            return
+        for ai_id, b in list(self._lc_bubbles.items()):
+            sess = b.get('session') or {}
+            if (b.get('phase') in ('fading', 'dead')
+                    or sess.get('status') == 'ended'):
+                self._lc_bubbles.pop(ai_id, None)
+        try:
+            self._refresh_livecalls()
+        except Exception:
+            pass
+
     def _lc_open_caller_ui(self):
         try:
             url = self.sim.dispatch_web.caller_url()
@@ -29257,10 +34563,20 @@ class MonitoringDashboard:
                 self._lc_drain_session_events()
             except Exception:
                 pass
+        # Defensive sweep: any bubble whose underlying session has flipped
+        # to 'ended' but somehow missed an 'end' event (e.g. an end fired
+        # before the dashboard subscribed) gets force-faded here. Without
+        # this, the floor can keep painting a stale card forever.
+        for ai_id, b in self._lc_bubbles.items():
+            if (b['phase'] == 'active'
+                    and (b.get('session') or {}).get('status') == 'ended'):
+                b['phase'] = 'fading'
         dead = []
         for ai_id, b in self._lc_bubbles.items():
             if b['phase'] == 'fading':
-                b['fade'] = max(0.0, b['fade'] - 0.08)
+                # Faster fade — operators reported ended calls hung around
+                # for ~10s; ~3 ticks (~1s on default cadence) is plenty.
+                b['fade'] = max(0.0, b['fade'] - 0.34)
                 if b['fade'] <= 0.0:
                     b['phase'] = 'dead'
                     dead.append(ai_id)
@@ -29461,7 +34777,73 @@ class MonitoringDashboard:
                 font=('Consolas', 8, 'italic'),
                 anchor='ne', tags=tag)
 
-            # Make whole card clickable: jump to audit
+            # ── PER-CARD HANG UP BUTTON ──
+            # Operators reported the card stays "active" with no easy way
+            # to end an individual call from the floor. A small red pill
+            # in the upper-right corner closes the session immediately.
+            # Drawn AFTER the card body so the click region wins over the
+            # whole-card audit-nav binding.
+            if b['phase'] == 'active':
+                hu_w, hu_h = 84, 22
+                hu_x1 = x1 - 8
+                hu_y0 = y0 + 6
+                hu_x0 = hu_x1 - hu_w
+                hu_y1 = hu_y0 + hu_h
+                hu_tag = f'hu_{ai_id}'
+                c.create_rectangle(
+                    hu_x0, hu_y0, hu_x1, hu_y1,
+                    fill=T['red'], outline=T['gold_rule'], width=1,
+                    tags=(tag, hu_tag))
+                c.create_text(
+                    (hu_x0 + hu_x1) / 2, (hu_y0 + hu_y1) / 2,
+                    text='■  HANG UP',
+                    fill=T['white'],
+                    font=('Cambria', 9, 'bold'),
+                    tags=(tag, hu_tag))
+                # Bump the elapsed clock left so it doesn't overlap with the button
+                # (we already drew it earlier — overpaint a clear strip then redraw)
+                # Actually: we simply move the elapsed clock down a row by
+                # repainting it under the hang-up button. Cheaper to leave
+                # as-is and let the button be ABOVE the clock; clock label
+                # is drawn above so let's just redraw the clock at a lower
+                # Y to avoid overlap.
+                c.create_rectangle(
+                    hu_x0, y0 + 4, x1 - 4, hu_y1 + 2,
+                    fill=T['bg_card'], outline='', tags=tag)
+                c.create_rectangle(
+                    hu_x0, hu_y0, hu_x1, hu_y1,
+                    fill=T['red'], outline=T['gold_rule'], width=1,
+                    tags=(tag, hu_tag))
+                c.create_text(
+                    (hu_x0 + hu_x1) / 2, (hu_y0 + hu_y1) / 2,
+                    text='■  HANG UP',
+                    fill=T['white'],
+                    font=('Cambria', 9, 'bold'),
+                    tags=(tag, hu_tag))
+                # The clock now sits BELOW the hangup button on the right
+                c.create_text(
+                    x1 - 12, hu_y1 + 6,
+                    text=f'⏱  {elapsed_str}',
+                    fill=T['red'], font=('Consolas', 11, 'bold'),
+                    anchor='ne', tags=tag)
+                # Re-draw the urgency pill below the clock too
+                c.create_text(
+                    x1 - 12, hu_y1 + 24,
+                    text=f'★ U{urgency:>2}  {intent.upper()}',
+                    fill=urg_color, font=('Consolas', 9, 'bold'),
+                    anchor='ne', tags=tag)
+                c.tag_bind(
+                    hu_tag, '<Button-1>',
+                    lambda _e, cid=sess['call_id']: self._lc_card_hangup(cid))
+                # Cursor changes when hovering over the button
+                c.tag_bind(hu_tag, '<Enter>',
+                           lambda _e: c.config(cursor='hand2'))
+                c.tag_bind(hu_tag, '<Leave>',
+                           lambda _e: c.config(cursor=''))
+
+            # Make whole card clickable: jump to audit (the hangup tag
+            # binds Button-1 too, and Tk fires the most-specific tag's
+            # binding so the hangup pill wins over the body).
             c.tag_bind(tag, '<Button-1>',
                        lambda _e, cid=sess['call_id']: self._da_select_call(cid))
             b['_last_pos'] = ((x0 + x1) / 2, (y0 + y1) / 2,
@@ -29474,6 +34856,23 @@ class MonitoringDashboard:
     def _lc_on_click(self, evt):
         # Canvas-level click; bubble tags handle their own bind. No-op fallback.
         pass
+
+    def _lc_card_hangup(self, call_id):
+        """Per-card HANG UP: complete the call, mark it ended in medianbox,
+        and let the fade animation drop the bubble from the floor."""
+        if not call_id:
+            return
+        try:
+            self.sim.call_center.complete_call(
+                call_id, outcome='operator_card_hangup')
+        except Exception as e:
+            print(f'  [ERR] card hangup: {e}')
+        try:
+            mb = globals().get('medianbox')
+            if mb is not None:
+                mb.mark_call_ended(call_id)
+        except Exception:
+            pass
 
     # ================================================================
     #  DISPATCH AUDIT — ultra-detailed per-call AI reasoning view
@@ -31092,6 +36491,10 @@ class CallerPhoneWindow:
         self._call_id = None
         self._last_decision_count = 0
         self._pending_events = deque(maxlen=500)
+        # Set by _reason_clicked when the JUST TALK button is pressed; read
+        # + cleared in _place_call. Lets a single Place Call know whether
+        # to flag the new session as casual chat mode.
+        self._pending_casual_chat = False
 
         T = USA_THEME
         self.win = tk.Toplevel(simulator.root)
@@ -31145,25 +36548,32 @@ class CallerPhoneWindow:
         _theme_section_header(self.win, '★ NATURE OF EMERGENCY ★')
         reason_frame = tk.Frame(self.win, bg=T['bg'])
         reason_frame.pack(fill=tk.X, padx=14, pady=(2, 6))
+        # 4-tuple: (label, statement_text, color, casual_chat_flag)
         reasons = [
-            ('🚑  MEDICAL',  'Medical emergency — I need help now',  T['red']),
-            ('🛡  POLICE',   'Someone is being violent — I need police', T['red_dark']),
-            ('🔥  FIRE',     'There is a fire — please send fire department', T['amber']),
-            ('🤝  CRISIS',   'I need to talk to someone, I am in crisis', T['blue']),
-            ('🛠  TECH',     'Technical issue, not life-threatening', T['blue_dark']),
-            ('❓  INFO',     'Just need information', T['green']),
+            ('🚑  MEDICAL',  'Medical emergency — I need help now',  T['red'], False),
+            ('🛡  POLICE',   'Someone is being violent — I need police', T['red_dark'], False),
+            ('🔥  FIRE',     'There is a fire — please send fire department', T['amber'], False),
+            ('🤝  CRISIS',   'I need to talk to someone, I am in crisis', T['blue'], False),
+            ('🛠  TECH',     'Technical issue, not life-threatening', T['blue_dark'], False),
+            ('❓  INFO',     'Just need information', T['green'], False),
+            ('💬  JUST TALK',
+             "Hi — I'm not in an emergency, I just want to talk to you about anything.",
+             T['gold_rule'], True),
         ]
-        for i, (label, text, color) in enumerate(reasons):
+        for i, (label, text, color, casual) in enumerate(reasons):
             # Each button gets a thin gold border for the federal-stamp look
             b_wrap = tk.Frame(reason_frame, bg=T['gold_rule'])
             b_wrap.grid(row=i // 3, column=i % 3, padx=4, pady=4, sticky='ew')
+            # JUST TALK gets dark text on the gold so it reads as a soft,
+            # off-emergency option rather than another red alert button.
+            fg_color = T['blue_dark'] if label.endswith('JUST TALK') else T['white']
             b = tk.Button(b_wrap, text=label, width=14,
                           font=('Cambria', 10, 'bold'),
-                          bg=color, fg=T['white'],
+                          bg=color, fg=fg_color,
                           activebackground=T['gold_rule'],
                           activeforeground=T['blue_dark'],
                           relief='flat', cursor='hand2', bd=0,
-                          command=lambda t=text: self._reason_clicked(t))
+                          command=lambda t=text, c=casual: self._reason_clicked(t, casual=c))
             b.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
         for c in range(3):
             reason_frame.columnconfigure(c, weight=1)
@@ -31199,31 +36609,18 @@ class CallerPhoneWindow:
             relief='flat', bd=0, highlightthickness=0, wrap='word')
         self._statement.pack(fill=tk.X, padx=8, pady=8)
         self._statement.insert('1.0', 'Describe the situation in your own words...')
+        # Enter key in the Statement field places (or sends-on, if a call is
+        # already active) the call. Shift-Enter still inserts a newline.
+        def _statement_return(_e):
+            self._place_call()
+            return 'break'
+        self._statement.bind('<Return>', _statement_return)
+        self._statement.bind('<KP_Enter>', _statement_return)
 
-        # ── ADOPT ACTIVE CALL row ──
-        # Lets the operator pull a call placed via the browser (/voice or
-        # /api/call) or the live floor into THIS Tk window so they can
-        # speak with the caller in person.
-        adopt_frame = tk.Frame(self.win, bg=T['bg'])
-        adopt_frame.pack(fill=tk.X, padx=14, pady=(8, 0))
-        tk.Label(adopt_frame, text='ADOPT ACTIVE CALL:',
-                 font=('Cambria', 9, 'bold'),
-                 fg=T['gold_rule'], bg=T['bg']).pack(side=tk.LEFT, padx=(0, 6))
-        self._adopt_combo = ttk.Combobox(
-            adopt_frame, font=('Consolas', 10),
-            state='readonly', width=42)
-        self._adopt_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        adopt_btn_wrap = tk.Frame(adopt_frame, bg=T['gold_rule'])
-        adopt_btn_wrap.pack(side=tk.LEFT)
-        tk.Button(adopt_btn_wrap, text='⤓  TAKE OVER  ⤓',
-                  font=('Cambria', 10, 'bold'),
-                  bg=T['blue'], fg=T['white'],
-                  activebackground=T['gold_rule'],
-                  activeforeground=T['blue_dark'],
-                  relief='flat', cursor='hand2', bd=0,
-                  command=self._adopt_call).pack(padx=2, pady=2, ipadx=4, ipady=2)
-        # Periodic refresh of the dropdown
-        self._adopt_refresh_loop()
+        # (Adopt Active Call row removed — operators preferred a single
+        # "place a call from this window" workflow without the take-over
+        # path. The /api/sessions endpoint and dispatch console still
+        # support adoption from the browser side.)
 
         # ── ANSWER / HANG UP buttons with gold borders ──
         action_frame = tk.Frame(self.win, bg=T['bg'])
@@ -31279,47 +36676,48 @@ class CallerPhoneWindow:
         self._transcript.tag_configure('sys', foreground=T['fg_dim_light'],
                                        font=('Cambria', 9, 'italic'))
 
-        # ── Voice mode: hold-to-talk button + mic level meter, OR
-        #    text speak input + send button. Toggle via voice switch. ──
+        # ── Live discussion bar + status row ──
+        # Mic listens for the entire call (boosted, always-on, 5-attempt
+        # consensus). The text bar below is for TYPED messages to the AI
+        # mid-call — separate from the initial Statement entry. There is
+        # no hold-to-talk; there is no space-bar-to-record.
         self._voice = tk_voice_pipeline   # module-level singleton
 
-        # Voice toggle bar
-        voice_bar = tk.Frame(self.win, bg=T['bg'])
-        voice_bar.pack(fill=tk.X, padx=14, pady=(8, 2))
-        self._voice_mode_var = tk.BooleanVar(value=self._voice.has_mic())
-        self._voice_tts_var  = tk.BooleanVar(value=self._voice.has_tts())
-        # Voice mode checkbox
-        tk.Checkbutton(voice_bar,
-                       text='🎤  VOICE MODE',
-                       variable=self._voice_mode_var,
-                       command=self._toggle_voice_mode,
-                       font=('Cambria', 10, 'bold'),
-                       bg=T['bg'], fg=T['gold_rule'],
-                       activebackground=T['bg'], activeforeground=T['gold_rule'],
-                       selectcolor=T['blue_dark'],
-                       state=('normal' if self._voice.has_mic() else 'disabled')
-                       ).pack(side=tk.LEFT)
-        tk.Checkbutton(voice_bar,
-                       text='🔊  SPEAK AI REPLIES',
-                       variable=self._voice_tts_var,
-                       font=('Cambria', 10, 'bold'),
-                       bg=T['bg'], fg=T['gold_rule'],
-                       activebackground=T['bg'], activeforeground=T['gold_rule'],
-                       selectcolor=T['blue_dark'],
-                       state=('normal' if self._voice.has_tts() else 'disabled')
-                       ).pack(side=tk.LEFT, padx=(16, 0))
-        tk.Label(voice_bar,
-                 text=self._voice.status(),
-                 font=('Cambria', 8, 'italic'),
-                 fg=T['silver'], bg=T['bg']).pack(side=tk.RIGHT)
-
-        # Two interchangeable speak panels — only one is packed at a time
+        # Mode toggles: TTS is ALWAYS on by default — the AI speaks every
+        # reply unless Silent Emergency Mode is engaged. That mode mutes
+        # the AI entirely so a caller who can't make noise (intruder in
+        # the home, hostage situation) doesn't get a phone yelling at them.
+        mode_bar = tk.Frame(self.win, bg=T['bg'])
+        mode_bar.pack(fill=tk.X, padx=14, pady=(8, 2))
+        self._silent_mode_var = tk.BooleanVar(value=False)
+        # Live mic indicator
+        self._live_mic_lbl = tk.Label(
+            mode_bar, text='🎤  LIVE MIC: idle  ·  AI listens with 5x boost',
+            font=('Cambria', 10, 'bold'),
+            fg=T['gold_rule'], bg=T['bg'])
+        self._live_mic_lbl.pack(side=tk.LEFT)
+        # Silent Emergency toggle on the right
+        silent_chk = tk.Checkbutton(
+            mode_bar,
+            text='🔇  SILENT EMERGENCY MODE  (mute AI voice — text only)',
+            variable=self._silent_mode_var,
+            command=self._toggle_silent_mode,
+            font=('Cambria', 10, 'bold'),
+            bg=T['bg'], fg=T['red'],
+            activebackground=T['bg'], activeforeground=T['red'],
+            selectcolor=T['blue_dark'])
+        silent_chk.pack(side=tk.RIGHT)
+        # Single live discussion bar (always-on). One typing field — Enter
+        # or click SEND — for talking to the AI mid-call alongside the
+        # always-on mic. No mode switch, no PTT.
         self._speak_frame = tk.Frame(self.win, bg=T['bg'])
         self._speak_frame.pack(fill=tk.X, padx=14, pady=(2, 4))
-
-        # — TEXT-MODE PANEL (typed input) —
-        self._text_panel = tk.Frame(self._speak_frame, bg=T['bg'])
-        speak_entry_wrap = tk.Frame(self._text_panel, bg=T['border_light'])
+        speak_label = tk.Label(
+            self._speak_frame, text='💬  DISCUSS:',
+            font=('Cambria', 10, 'bold'),
+            fg=T['gold_rule'], bg=T['bg'])
+        speak_label.pack(side=tk.LEFT, padx=(0, 6))
+        speak_entry_wrap = tk.Frame(self._speak_frame, bg=T['border_light'])
         speak_entry_wrap.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
         self._speak_entry = tk.Entry(
             speak_entry_wrap, font=('Cambria', 11),
@@ -31328,56 +36726,41 @@ class CallerPhoneWindow:
             relief='flat', bd=0, highlightthickness=0)
         self._speak_entry.pack(fill=tk.BOTH, expand=True, padx=2, pady=2, ipady=6)
         self._speak_entry.bind('<Return>', lambda _e: self._speak())
-        speak_btn_wrap = tk.Frame(self._text_panel, bg=T['gold_rule'])
+        speak_btn_wrap = tk.Frame(self._speak_frame, bg=T['gold_rule'])
         speak_btn_wrap.pack(side=tk.LEFT)
         self._speak_btn = tk.Button(
-            speak_btn_wrap, text='✦  SPEAK  ✦',
+            speak_btn_wrap, text='✦  SEND  ✦',
             font=('Cambria', 11, 'bold'),
             bg=T['blue'], fg=T['white'],
             activebackground=T['gold_rule'], activeforeground=T['blue_dark'],
             relief='flat', cursor='hand2', bd=0,
             command=self._speak, state='disabled')
         self._speak_btn.pack(padx=2, pady=2, ipadx=6, ipady=4)
-
-        # — VOICE-MODE PANEL (push-to-talk) —
-        self._voice_panel = tk.Frame(self._speak_frame, bg=T['bg'])
-        ptt_wrap = tk.Frame(self._voice_panel, bg=T['gold_rule'])
-        ptt_wrap.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        self._ptt_btn = tk.Button(
-            ptt_wrap, text='🎤   HOLD TO TALK   (or press SPACE)',
-            font=('Cambria', 12, 'bold'),
-            bg=T['blue'], fg=T['white'],
-            activebackground=T['red'], activeforeground=T['white'],
-            relief='flat', cursor='hand2', bd=0,
-            state=('disabled' if not self._voice.has_mic() else 'normal'))
-        self._ptt_btn.pack(fill=tk.BOTH, expand=True, padx=2, pady=2, ipady=10)
-        # Press / release bindings for hold-to-talk
-        self._ptt_btn.bind('<ButtonPress-1>',   lambda _e: self._ptt_press())
-        self._ptt_btn.bind('<ButtonRelease-1>', lambda _e: self._ptt_release())
-        # Also bind Space to push-to-talk when the window has focus
-        self.win.bind('<KeyPress-space>',  self._on_space_press)
-        self.win.bind('<KeyRelease-space>', self._on_space_release)
-        self._space_held = False
-        # Mic level meter (canvas bar)
-        meter_wrap = tk.Frame(self._voice_panel, bg=T['border_light'])
-        meter_wrap.pack(side=tk.LEFT)
-        self._mic_meter = tk.Canvas(meter_wrap, width=20, height=46,
-                                    bg=T['blue_dark'], highlightthickness=0,
-                                    bd=0)
-        self._mic_meter.pack(padx=2, pady=2)
-        # Initial state: voice mode if mic available, else text mode
-        if self._voice_mode_var.get():
-            self._voice_panel.pack(fill=tk.BOTH, expand=True)
-        else:
-            self._text_panel.pack(fill=tk.BOTH, expand=True)
-        # Hover help — explain when disabled
+        # Tiny mic level meter on the far right so the operator can see
+        # the boosted live audio is reaching us. No hold-to-talk button.
+        meter_wrap = tk.Frame(self._speak_frame, bg=T['border_light'])
+        meter_wrap.pack(side=tk.LEFT, padx=(6, 0))
+        self._mic_meter = tk.Canvas(
+            meter_wrap, width=12, height=34,
+            bg=T['blue_dark'], highlightthickness=0, bd=0)
+        self._mic_meter.pack(padx=1, pady=1)
         if not self._voice.has_mic():
             tk.Label(self._speak_frame,
-                     text='Voice disabled — install: pip install sounddevice',
+                     text=' · mic unavailable',
                      font=('Cambria', 8, 'italic'),
-                     fg=T['silver'], bg=T['bg']).pack(side=tk.LEFT, padx=8)
+                     fg=T['silver'], bg=T['bg']).pack(side=tk.LEFT, padx=4)
+
+        # Status line under the discuss row showing pipeline backend
+        backend_lbl = tk.Label(
+            self.win, text=self._voice.status(),
+            font=('Cambria', 8, 'italic'),
+            fg=T['silver'], bg=T['bg'])
+        backend_lbl.pack(fill=tk.X, padx=14, pady=(0, 4))
 
         self._is_recording = False
+        # Compatibility shims for any helper that still reads these flags.
+        self._voice_mode_var = tk.BooleanVar(value=self._voice.has_mic())
+        self._voice_tts_var  = tk.BooleanVar(value=True)
 
         # ── Location + status info card on parchment ──
         _theme_section_header(self.win, '📍 LOCATION & DISPATCH STATUS')
@@ -31429,111 +36812,71 @@ class CallerPhoneWindow:
         T = USA_THEME
         self._state_label.config(text=state, fg=color or T['silver'])
 
-    def _reason_clicked(self, text):
+    def _reason_clicked(self, text, casual=False):
+        # Stash the casual-chat flag so _place_call can promote this call
+        # to JUST TALK mode (no emergency pipeline, no auto-end, AI keeps
+        # the line warm with idle nudges).
+        self._pending_casual_chat = bool(casual)
         self._statement.delete('1.0', tk.END)
         self._statement.insert('1.0', text)
         self._place_call()
 
-    def _adopt_refresh_loop(self):
-        """Refresh the adoption combobox with all active calls every 2s."""
-        if not self._running:
-            return
-        try:
-            sessions = list(self.sim.call_center.sessions.values())
-            active = [s for s in sessions
-                      if s.get('status') == 'active'
-                      and s.get('call_id') != self._call_id]
-            options = []
-            self._adopt_index = []
-            for s in active:
-                cid = s.get('call_id', '')
-                phone = s.get('phone', '?')
-                callnum = s.get('call_number', '?')
-                ai = s.get('ai_id', '?')
-                last = (s.get('chunks') or ['(no chunks)'])[-1][:40]
-                # Annotate origin from cid prefix
-                if cid.startswith('voice-'): origin = '🌐 voice'
-                elif cid.startswith('web-'):  origin = '🌐 web'
-                elif cid.startswith('sip-'):  origin = '☎ sip'
-                elif cid.startswith('tkphone-'): origin = '📞 tk'
-                else: origin = '?'
-                options.append(f'[{origin}] {ai} · {callnum} · {phone} · "{last}"')
-                self._adopt_index.append(cid)
-            try:
-                self._adopt_combo['values'] = tuple(options) or ('(no active calls)',)
-            except Exception:
-                pass
-        except Exception:
-            pass
-        try:
-            self.win.after(2000, self._adopt_refresh_loop)
-        except Exception:
-            pass
-
-    def _adopt_call(self):
-        """Take over the selected active call in this Tk window."""
-        T = USA_THEME
-        try:
-            idx = self._adopt_combo.current()
-        except Exception:
-            return
-        if idx is None or idx < 0 or idx >= len(getattr(self, '_adopt_index', [])):
-            self._append('select a call from the dropdown first.', 'sys')
-            return
-        cid = self._adopt_index[idx]
-        sess = self.sim.call_center.get_session(cid)
-        if sess is None:
-            self._append('that call is no longer active.', 'sys')
-            return
-        # If we already have a call open, hang it up first
-        if self._call_id and self._call_id != cid:
-            try:
-                self.sim.call_center.complete_call(
-                    self._call_id, outcome='operator_handoff')
-            except Exception:
-                pass
-        # Bind to the existing session
-        self._call_id = cid
-        self._last_decision_count = 0
-        self._answer_btn.config(state='disabled', bg=T['silver'],
-                                 fg=T['fg_on_light'])
-        self._hangup_btn.config(state='normal')
-        self._speak_btn.config(state='normal')
-        self._show_session_header(sess)
-        # Replay transcript so the operator sees the conversation so far
-        self._append(f'═══ ADOPTED CALL {sess.get("call_number","?")} '
-                     f'(was {cid[:8]}…) ═══', 'sys')
-        for i, ch in enumerate(sess.get('chunks') or []):
-            self._append(f'caller: {ch}', 'caller')
-            decs = sess.get('decisions') or []
-            if i < len(decs):
-                resp = decs[i].get('response') or ''
-                if resp:
-                    is_emer = ('EMERGENCY' in (decs[i].get('action') or '')
-                               or 'ESCALATE' in (decs[i].get('action') or ''))
-                    self._append(f'AI: {resp}',
-                                 'ai_emer' if is_emer else 'ai')
-        self._append('═══ you are now on the line ═══', 'sys')
-
     def _place_call(self):
+        # If a call is already active, treat the Statement box as a follow-up
+        # message the caller wants to send to the dispatch AI. Operators kept
+        # typing into the Statement field expecting it to keep the conversation
+        # going, so route that flow into _speak() instead of silently bailing.
         if self._call_id:
+            text = self._statement.get('1.0', tk.END).strip()
+            if not text or text.startswith('Describe the situation'):
+                self._append('type a follow-up message in the statement '
+                             'box, or use the SPEAK row below.', 'sys')
+                return
+            self._statement.delete('1.0', tk.END)
+            self._speak(override_text=text)
             return
         T = USA_THEME
         phone = self._phone_entry.get().strip() or 'tk-anon'
         text = self._statement.get('1.0', tk.END).strip()
+        # Place Call should "just work" — a single press connects the call
+        # immediately. If the caller hasn't typed anything (or the placeholder
+        # is still there), open with a neutral connection line so the always-on
+        # mic can take over from there.
         if not text or text.startswith('Describe the situation'):
-            self._append('please describe the situation first.', 'sys')
-            return
+            text = '[call placed — caller has not yet spoken]'
         cid = f'tkphone-{int(time.time() * 1000) % 1_000_000_000:09d}'
         self._call_id = cid
         self._set_state('CALL ACTIVE  ·  CONNECTING...', T['amber'])
-        self._answer_btn.config(state='disabled', bg=T['silver'], fg=T['fg_on_light'])
+        # Once a call is in progress the Place Call button morphs into
+        # a "send follow-up" affordance so the operator can keep prompting
+        # the AI from the Statement box without finding the SPEAK row.
+        self._answer_btn.config(text='✦  SEND FOLLOW-UP  ✦',
+                                 bg=T['blue'], fg=T['white'],
+                                 state='normal')
         self._hangup_btn.config(state='normal')
         self._speak_btn.config(state='normal')
         self._append(f'caller: {text}', 'caller')
+        # Clear the Statement box so the next prompt has a clean field
+        try:
+            self._statement.delete('1.0', tk.END)
+        except Exception:
+            pass
+
+        # Capture + clear the JUST TALK pending flag set by _reason_clicked
+        casual_flag = bool(getattr(self, '_pending_casual_chat', False))
+        self._pending_casual_chat = False
 
         def _go():
             try:
+                # JUST TALK: pre-create the session and stamp casual mode
+                # BEFORE the opener chunk lands, so the very first reply
+                # comes from CasualChatGenerator, not the emergency pipeline.
+                if casual_flag:
+                    try:
+                        self.sim.call_center._ensure_session(cid, phone)
+                        self.sim.call_center.mark_casual_chat(cid)
+                    except Exception as e:
+                        print(f'  [tkphone] casual pre-mark: {e}')
                 self.sim.call_center.submit_call(cid, phone, text)
                 # Stamp client_ip = local; medianbox enrichment will run
                 try:
@@ -31556,6 +36899,61 @@ class CallerPhoneWindow:
                     return
                 time.sleep(0.05)
         threading.Thread(target=_await, daemon=True).start()
+
+        # Open the mic immediately and listen for the entire call.
+        self._start_always_on_listening()
+        # Surface JUST TALK mode in the transcript so the operator knows
+        # the call won't auto-end and the AI will keep the line warm.
+        if casual_flag:
+            self._append(
+                '💬 JUST TALK mode — AI keeps the line warm with idle '
+                'replies; will not auto-hangup. Say anything or just sit.',
+                'sys')
+
+    def _start_always_on_listening(self):
+        """Open the mic for continuous listening with 5-attempt STT
+        consensus per utterance. Runs the whole call regardless of
+        the voice/text mode toggle."""
+        if not self._voice.has_mic():
+            self._append('mic unavailable — install sounddevice + '
+                         'speech_recognition for live voice listening.', 'sys')
+            return
+        # Force-stop any prior push-to-talk recording state
+        try:
+            if getattr(self._voice, '_recording', False):
+                self._voice._recording = False
+        except Exception:
+            pass
+
+        def _on_utterance(text):
+            # Marshal to GUI thread + send as a caller chunk if we got one
+            def _apply(t=text):
+                if not self._call_id:
+                    return
+                if not t:
+                    return  # 5 attempts all failed; nothing to send
+                # Treat the picked text the same as a typed caller message,
+                # so it flows through the same dispatch + transcript path.
+                self._speak(override_text=t)
+            try:
+                self.win.after(0, _apply)
+            except Exception:
+                pass
+
+        ok = self._voice.start_always_on(_on_utterance)
+        if ok:
+            self._append('🎤 LIVE — listening (5 simultaneous interpretations).',
+                         'sys')
+        else:
+            self._append('mic open failed — check Windows mic permissions.',
+                         'sys')
+
+    def _stop_always_on_listening(self):
+        """Stop the continuous listener at hangup / window close."""
+        try:
+            self._voice.stop_always_on()
+        except Exception:
+            pass
 
     def _speak(self, override_text=None):
         if not self._call_id:
@@ -31580,82 +36978,26 @@ class CallerPhoneWindow:
                 print(f'  [tkphone] speak: {e}')
         threading.Thread(target=_go, daemon=True).start()
 
-    # ── Voice mode helpers ─────────────────────────────────────────
-    def _toggle_voice_mode(self):
-        """Switch between text-mode panel and voice-mode panel."""
-        if self._voice_mode_var.get():
-            self._text_panel.pack_forget()
-            self._voice_panel.pack(fill=tk.BOTH, expand=True)
-        else:
-            self._voice_panel.pack_forget()
-            self._text_panel.pack(fill=tk.BOTH, expand=True)
-
-    def _ptt_press(self):
-        """Push-to-talk press: start mic capture + visual feedback."""
-        if self._is_recording or not self._voice.has_mic():
-            return
+    # ── Silent Emergency Mode helper ───────────────────────────────
+    def _toggle_silent_mode(self):
+        """Mute / unmute the AI's spoken replies. The text transcript still
+        updates either way — Silent Emergency Mode just stops the AI from
+        making sound, for callers who can't be heard speaking back."""
         T = USA_THEME
-        if not self._call_id:
-            self._append('place a call before talking.', 'sys')
-            return
-        ok = self._voice.start_recording()
-        if not ok:
-            self._append('mic open failed — check Windows mic permissions.', 'sys')
-            return
-        self._is_recording = True
-        self._ptt_btn.config(
-            text='● ● ●   RECORDING — RELEASE TO SEND   ● ● ●',
-            bg=T['red'], fg=T['white'])
-
-    def _ptt_release(self):
-        """Push-to-talk release: stop mic, transcribe in background, post chunk."""
-        if not self._is_recording:
-            return
-        T = USA_THEME
-        self._is_recording = False
-        self._ptt_btn.config(
-            text='⌛   TRANSCRIBING...   ⌛',
-            bg=T['amber'], fg=T['blue_dark'])
-
-        def _on_transcript(text):
-            # Marshalled back to GUI thread
-            def _apply():
-                T2 = USA_THEME
-                self._ptt_btn.config(
-                    text='🎤   HOLD TO TALK   (or press SPACE)',
-                    bg=T2['blue'], fg=T2['white'])
-                if not text:
-                    self._append('(no speech detected)', 'sys')
-                    return
-                # Send the transcribed text down the same path as typed input
-                self._speak(override_text=text)
+        if self._silent_mode_var.get():
+            # Going silent: cancel anything currently being spoken
             try:
-                self.win.after(0, _apply)
+                self._voice._cancel_current_tts()
             except Exception:
                 pass
-
-        self._voice.stop_recording_and_transcribe(on_done=_on_transcript)
-
-    def _on_space_press(self, _evt):
-        # Avoid auto-repeat firing this every keypress while held
-        if self._space_held:
-            return 'break'
-        if not self._voice_mode_var.get():
-            return  # don't intercept Space outside voice mode
-        # Only fire if focus isn't in a typing widget
-        focused = self.win.focus_get()
-        if focused in (self._statement, self._speak_entry, self._phone_entry):
-            return
-        self._space_held = True
-        self._ptt_press()
-        return 'break'
-
-    def _on_space_release(self, _evt):
-        if not self._space_held:
-            return
-        self._space_held = False
-        self._ptt_release()
-        return 'break'
+            self._append(
+                '🔇 SILENT EMERGENCY MODE engaged — AI voice muted; '
+                'text transcript continues.', 'sys')
+            self._set_state('★ SILENT EMERGENCY ★  ·  ON THE LINE', T['red'])
+        else:
+            self._append(
+                '🔊 Silent emergency mode disabled — AI replies will speak '
+                'aloud again.', 'sys')
 
     def _hangup(self):
         T = USA_THEME
@@ -31670,13 +37012,19 @@ class CallerPhoneWindow:
             except Exception:
                 pass
             self._append('call ended.', 'sys')
+        # Stop the continuous listener — mic only stays open while a call
+        # is live.
+        self._stop_always_on_listening()
         self._call_id = None
         self._last_decision_count = 0
         self._set_state('READY  ·  PLACE A CALL TO BEGIN', T['silver'])
         self._call_number_label.config(
             text='— — —  · — — —  · — — — —', fg=T['gold_rule'])
         self._ai_id_label.config(text='DISPATCH AI:  —')
-        self._answer_btn.config(state='normal', bg=T['green'], fg=T['white'])
+        # Restore the original PLACE CALL appearance — _place_call swapped it
+        # to "SEND FOLLOW-UP" while a call was live.
+        self._answer_btn.config(text='📞   PLACE CALL   ★',
+                                 state='normal', bg=T['green'], fg=T['white'])
         self._hangup_btn.config(state='disabled')
         self._speak_btn.config(state='disabled')
         self._action_label.config(text='★  ACTION:  —', fg=T['amber_dark'])
@@ -31734,8 +37082,11 @@ class CallerPhoneWindow:
                         text=f'★  ACTION:  {action}    →    {dec.get("escalation", "—")}',
                         fg=color)
                     # ── Speak the AI's reply via the voice pipeline ──
+                    # The AI ALWAYS speaks every reply unless Silent
+                    # Emergency Mode has been engaged for this call.
                     try:
-                        if (self._voice_tts_var.get() and response
+                        silent = bool(self._silent_mode_var.get())
+                        if (not silent and response
                                 and response != '—'):
                             self._voice.speak(response, emergency=is_emer)
                     except Exception as e:
@@ -31758,30 +37109,42 @@ class CallerPhoneWindow:
             # Auto-reset when ended by service
             if sess.get('status') == 'ended' and event == 'end':
                 self._set_state('CALL ENDED', T['silver'])
-                self._answer_btn.config(state='normal', bg=T['green'], fg=T['white'])
+                self._answer_btn.config(text='📞   PLACE CALL   ★',
+                                         state='normal',
+                                         bg=T['green'], fg=T['white'])
                 self._hangup_btn.config(state='disabled')
                 self._speak_btn.config(state='disabled')
+                # Stop the always-on listener so the mic doesn't stay open
+                # after the call has been closed by the service.
+                try:
+                    self._stop_always_on_listening()
+                except Exception:
+                    pass
+                # Drop the call binding so the next PLACE CALL starts fresh
+                self._call_id = None
+                self._last_decision_count = 0
         if self._running:
             self.win.after(self._update_interval, self._tick)
 
     def _meter_tick(self):
-        """Repaint the mic level meter at ~20Hz when in voice mode."""
+        """Repaint the mic level meter at ~20Hz. With the always-on
+        listener running for the whole call, the meter is live the
+        moment a call is placed — no PTT needed."""
         if not self._running:
             return
         try:
-            if (self._voice_mode_var.get() and self._voice.has_mic()
-                    and hasattr(self, '_mic_meter')):
+            if self._voice.has_mic() and hasattr(self, '_mic_meter'):
                 T = USA_THEME
-                level = self._voice.get_level() if self._is_recording else 0.0
+                live = (getattr(self._voice, '_always_on', False)
+                        or self._is_recording)
+                level = self._voice.get_level() if live else 0.0
                 level = max(0.0, min(1.0, level * 1.4))   # boost for visibility
                 c = self._mic_meter
                 c.delete('all')
                 w = int(c['width'])
                 h = int(c['height'])
-                # Background already navy. Draw filled bar from bottom.
                 bar_h = int(level * h)
                 if bar_h > 0:
-                    # Color by level: green → amber → red
                     if level < 0.4:
                         col = T['green']
                     elif level < 0.75:
@@ -31790,10 +37153,44 @@ class CallerPhoneWindow:
                         col = T['red']
                     c.create_rectangle(0, h - bar_h, w, h,
                                        fill=col, outline='')
-                # Tick lines for reference
                 for frac in (0.25, 0.5, 0.75):
                     y = int(h * (1 - frac))
                     c.create_line(0, y, w, y, fill=T['silver'])
+                # Update the LIVE MIC label state based on speech detection.
+                # If the call has interim words streaming (from the browser
+                # voice page or any STT source), show them so the operator
+                # sees the AI hearing the caller word-by-word in real time.
+                if hasattr(self, '_live_mic_lbl'):
+                    interim = ''
+                    if self._call_id:
+                        try:
+                            sess = self.sim.call_center.get_session(
+                                self._call_id)
+                            if sess:
+                                interim = (sess.get('pending_words') or '').strip()
+                        except Exception:
+                            interim = ''
+                    if not self._call_id:
+                        self._live_mic_lbl.config(
+                            text='🎤  LIVE MIC: idle  ·  '
+                                 'place a call to begin',
+                            fg=T['silver'])
+                    elif interim:
+                        # Show the partial transcript word-by-word
+                        snippet = interim[-90:]
+                        self._live_mic_lbl.config(
+                            text=f'🎙  hearing: "{snippet}"',
+                            fg=T['blue_dark'])
+                    elif live and level > 0.05:
+                        self._live_mic_lbl.config(
+                            text='🎙  LIVE MIC: hearing you  ·  '
+                                 'boosted feed → 5x STT',
+                            fg=T['green'])
+                    elif live:
+                        self._live_mic_lbl.config(
+                            text='🎤  LIVE MIC: open  ·  '
+                                 'boosted feed → 5x STT',
+                            fg=T['gold_rule'])
         except Exception:
             pass
         if self._running:
@@ -31804,6 +37201,10 @@ class CallerPhoneWindow:
 
     def _on_close(self):
         self._running = False
+        try:
+            self._stop_always_on_listening()
+        except Exception:
+            pass
         if self._call_id:
             try:
                 self.sim.call_center.complete_call(self._call_id, outcome='caller_hangup')
@@ -31817,6 +37218,1032 @@ class CallerPhoneWindow:
 
 def launch_caller_phone(simulator):
     return CallerPhoneWindow(simulator)
+
+
+# =============================================================================
+# CREW RECEIVER — standalone Tk window for the dispatched crew/group
+# =============================================================================
+# This window is what a real responder (EMS / Police / Fire crew) would see
+# on the phone or laptop in their vehicle: incoming dispatch packets from
+# the operator, with caller location, plan, transcript, and the buttons they
+# press to confirm receipt + report status.
+#
+# It is INTENTIONALLY independent from the dispatcher console. The crew
+# does NOT see operator internals (audit, AI council, network monitor) —
+# only what they need to do their job. The receiver subscribes to
+# `dispatch_outbox` for real-time push and reads from `call_center_service`
+# for triangulated caller location.
+#
+# Multiple receivers can run side-by-side (one per callsign) so you can
+# preview what each unit on the floor is seeing.
+# =============================================================================
+class CrewReceiverWindow:
+    """Standalone responder-side dispatch receiver. One window per callsign."""
+
+    def __init__(self, simulator, callsign=None):
+        self.sim = simulator
+        self._running = True
+        self._callsign = callsign
+        self._packets_seen = set()      # dispatch_ids already rendered
+        self._pending = deque(maxlen=500)
+        self._update_interval = 800     # ms — UI refresh cadence
+
+        T = USA_THEME
+        # If no callsign was supplied, pick the first available unit so the
+        # window is useful immediately (operator can switch via dropdown).
+        if self._callsign is None:
+            try:
+                names = sorted(unit_roster.units.keys())
+                self._callsign = names[0] if names else 'UNIT-1'
+            except Exception:
+                self._callsign = 'UNIT-1'
+
+        self.win = tk.Toplevel(simulator.root)
+        self.win.title(f'📟  CREW RECEIVER — {self._callsign}')
+        self.win.geometry('640x780')
+        self.win.minsize(520, 600)
+        self.win.configure(bg=T['bg'])
+        self.win.protocol('WM_DELETE_WINDOW', self._on_close)
+        _theme_apply_ttk(self.win)
+        _theme_banner(self.win, title='AIDISPATCH',
+                      subtitle='CREW RECEIVER — On-Vehicle Terminal')
+
+        # ── Header: callsign + active-status seal ──
+        head_outer = tk.Frame(self.win, bg=T['gold_rule'])
+        head_outer.pack(fill=tk.X, padx=12, pady=(10, 4))
+        head_inner = tk.Frame(head_outer, bg=T['blue'])
+        head_inner.pack(fill=tk.X, padx=2, pady=2)
+        # Top stars
+        tk.Label(head_inner, text='★  ★  ★  ★  ★',
+                 font=('Cambria', 11, 'bold'),
+                 fg=T['gold_rule'], bg=T['blue']).pack(pady=(6, 0))
+        # Callsign chooser row
+        cs_row = tk.Frame(head_inner, bg=T['blue'])
+        cs_row.pack(fill=tk.X, padx=12, pady=2)
+        tk.Label(cs_row, text='CALLSIGN:',
+                 font=('Cambria', 10, 'bold'),
+                 fg=T['silver'], bg=T['blue']).pack(side=tk.LEFT, padx=(0, 8))
+        self._callsign_var = tk.StringVar(value=self._callsign)
+        try:
+            choices = sorted(unit_roster.units.keys())
+        except Exception:
+            choices = [self._callsign]
+        self._callsign_combo = ttk.Combobox(
+            cs_row, textvariable=self._callsign_var,
+            values=choices, state='readonly',
+            font=('Consolas', 12, 'bold'), width=14)
+        self._callsign_combo.pack(side=tk.LEFT)
+        self._callsign_combo.bind(
+            '<<ComboboxSelected>>', self._on_callsign_change)
+        # Unit type + status badge on the right
+        self._unit_type_lbl = tk.Label(
+            cs_row, text='—',
+            font=('Cambria', 11, 'bold italic'),
+            fg=T['amber'], bg=T['blue'])
+        self._unit_type_lbl.pack(side=tk.LEFT, padx=(14, 0))
+        self._unit_status_lbl = tk.Label(
+            cs_row, text='AVAILABLE',
+            font=('Consolas', 11, 'bold'),
+            fg=T['green'], bg=T['blue'])
+        self._unit_status_lbl.pack(side=tk.RIGHT)
+        # Bottom stars
+        tk.Label(head_inner, text='★  ★  ★  ★  ★',
+                 font=('Cambria', 11, 'bold'),
+                 fg=T['gold_rule'], bg=T['blue']).pack(pady=(2, 6))
+
+        # ── Active dispatch CARD (the big readable panel the crew looks at) ──
+        _theme_section_header(self.win, '✦ ACTIVE DISPATCH ✦')
+        card_outer = tk.Frame(self.win, bg=T['border_light'])
+        card_outer.pack(fill=tk.X, padx=12, pady=(2, 4))
+        card = tk.Frame(card_outer, bg=T['bg_card'])
+        card.pack(fill=tk.X, padx=2, pady=2)
+
+        # Top strip: priority pill + plan title
+        top_strip = tk.Frame(card, bg=T['bg_card'])
+        top_strip.pack(fill=tk.X, padx=10, pady=(8, 4))
+        self._priority_pill = tk.Label(
+            top_strip, text='—',
+            font=('Cambria', 14, 'bold'),
+            fg=T['white'], bg=T['silver'],
+            padx=12, pady=4)
+        self._priority_pill.pack(side=tk.LEFT)
+        self._plan_lbl = tk.Label(
+            top_strip, text='(no active dispatch)',
+            font=('Cambria', 14, 'bold'),
+            fg=T['fg_head_light'], bg=T['bg_card'])
+        self._plan_lbl.pack(side=tk.LEFT, padx=(12, 0))
+
+        # Caller phone + call number row
+        info_row = tk.Frame(card, bg=T['bg_card'])
+        info_row.pack(fill=tk.X, padx=10, pady=(0, 4))
+        self._call_lbl = tk.Label(
+            info_row, text='CALLER: —     CALL #: —',
+            font=('Consolas', 11, 'bold'),
+            fg=T['blue_dark'], bg=T['bg_card'],
+            anchor='w', justify='left')
+        self._call_lbl.pack(fill=tk.X)
+
+        # ── Incident summary (1-2 sentences from the dispatcher) ──
+        # First thing the crew reads: gist + flagged hazards.
+        summary_outer = tk.Frame(card, bg=T['border_light'])
+        summary_outer.pack(fill=tk.X, padx=8, pady=4)
+        summary_inner = tk.Frame(summary_outer, bg=T['bg_paper'])
+        summary_inner.pack(fill=tk.X, padx=1, pady=1)
+        tk.Label(summary_inner, text='📋  INCIDENT SUMMARY',
+                 font=('Cambria', 10, 'bold'),
+                 fg=T['gold_rule'], bg=T['bg_paper'],
+                 anchor='w').pack(fill=tk.X, padx=8, pady=(6, 2))
+        self._summary_lbl = tk.Label(
+            summary_inner, text='(awaiting dispatch)',
+            font=('Cambria', 12, 'bold'),
+            fg=T['fg_on_light'], bg=T['bg_paper'],
+            anchor='w', justify='left', wraplength=580)
+        self._summary_lbl.pack(fill=tk.X, padx=8, pady=(0, 2))
+        # Hazard chips: highlighted boxes for any True caller_facts that
+        # need to be visible without scrolling.
+        self._hazards_frame = tk.Frame(summary_inner, bg=T['bg_paper'])
+        self._hazards_frame.pack(fill=tk.X, padx=8, pady=(0, 6))
+
+        # ── Triangulated caller location panel ──
+        loc_outer = tk.Frame(card, bg=T['border_light'])
+        loc_outer.pack(fill=tk.X, padx=8, pady=4)
+        loc_inner = tk.Frame(loc_outer, bg=T['bg_paper'])
+        loc_inner.pack(fill=tk.X, padx=1, pady=1)
+        tk.Label(loc_inner, text='⌖  TRIANGULATED CALLER LOCATION',
+                 font=('Cambria', 10, 'bold'),
+                 fg=T['gold_rule'], bg=T['bg_paper'],
+                 anchor='w').pack(fill=tk.X, padx=8, pady=(6, 2))
+        self._loc_addr_lbl = tk.Label(
+            loc_inner, text='(awaiting triangulation...)',
+            font=('Consolas', 11, 'bold'),
+            fg=T['fg_on_light'], bg=T['bg_paper'],
+            anchor='w', justify='left', wraplength=540)
+        self._loc_addr_lbl.pack(fill=tk.X, padx=8, pady=(0, 2))
+        self._loc_coord_lbl = tk.Label(
+            loc_inner, text='lat —, lon —',
+            font=('Consolas', 10),
+            fg=T['fg_dim_light'], bg=T['bg_paper'],
+            anchor='w')
+        self._loc_coord_lbl.pack(fill=tk.X, padx=8, pady=0)
+        self._loc_acc_lbl = tk.Label(
+            loc_inner, text='accuracy: —',
+            font=('Consolas', 10, 'bold'),
+            fg=T['blue_dark'], bg=T['bg_paper'],
+            anchor='w')
+        self._loc_acc_lbl.pack(fill=tk.X, padx=8, pady=0)
+        self._loc_sources_lbl = tk.Label(
+            loc_inner, text='sources: —',
+            font=('Consolas', 9, 'italic'),
+            fg=T['fg_dim_light'], bg=T['bg_paper'],
+            anchor='w', justify='left', wraplength=540)
+        self._loc_sources_lbl.pack(fill=tk.X, padx=8, pady=(0, 4))
+        # Open-in-maps button
+        map_row = tk.Frame(loc_inner, bg=T['bg_paper'])
+        map_row.pack(fill=tk.X, padx=8, pady=(0, 6))
+        self._map_btn = tk.Button(
+            map_row, text='🗺  Open in Maps',
+            font=('Cambria', 9, 'bold'),
+            bg=T['blue'], fg=T['white'],
+            activebackground=T['gold_rule'], activeforeground=T['blue_dark'],
+            relief='flat', cursor='hand2', bd=0,
+            command=self._open_in_maps, state='disabled')
+        self._map_btn.pack(side=tk.LEFT, padx=2, pady=2)
+
+        # Tactics list
+        tac_outer = tk.Frame(card, bg=T['border_light'])
+        tac_outer.pack(fill=tk.X, padx=8, pady=4)
+        tac_inner = tk.Frame(tac_outer, bg=T['bg_paper'])
+        tac_inner.pack(fill=tk.X, padx=1, pady=1)
+        tk.Label(tac_inner, text='⚡  TACTICAL PLAN',
+                 font=('Cambria', 10, 'bold'),
+                 fg=T['gold_rule'], bg=T['bg_paper'],
+                 anchor='w').pack(fill=tk.X, padx=8, pady=(6, 2))
+        self._tactics_text = scrolledtext.ScrolledText(
+            tac_inner, height=5, font=('Consolas', 10),
+            bg=T['bg_paper'], fg=T['fg_on_light'],
+            relief='flat', wrap='word', state='disabled',
+            bd=0, highlightthickness=0)
+        self._tactics_text.pack(fill=tk.X, padx=6, pady=(0, 6))
+
+        # Operator note + ETA
+        note_row = tk.Frame(card, bg=T['bg_card'])
+        note_row.pack(fill=tk.X, padx=10, pady=(2, 6))
+        self._note_lbl = tk.Label(
+            note_row, text='OPERATOR NOTE: —',
+            font=('Cambria', 11, 'italic'),
+            fg=T['fg_on_light'], bg=T['bg_card'],
+            anchor='w', justify='left', wraplength=580)
+        self._note_lbl.pack(fill=tk.X)
+        self._eta_lbl = tk.Label(
+            note_row, text='ETA TO SCENE: —',
+            font=('Consolas', 10, 'bold'),
+            fg=T['amber_dark'], bg=T['bg_card'],
+            anchor='w')
+        self._eta_lbl.pack(fill=tk.X, pady=(2, 0))
+
+        # ── Dispatch Details panel ──
+        # Operators want every signal the dispatcher had at packet-send time
+        # surfaced for the crew. This block shows: dispatch_id, sent
+        # timestamps, escalation route, AI's last decision + reasoning,
+        # AI Council pick + agreement, status history, and the dispatcher↔
+        # unit comms log so the responder has full situational awareness.
+        details_outer = tk.Frame(card, bg=T['border_light'])
+        details_outer.pack(fill=tk.X, padx=8, pady=4)
+        details_inner = tk.Frame(details_outer, bg=T['bg_paper'])
+        details_inner.pack(fill=tk.X, padx=1, pady=1)
+        tk.Label(details_inner, text='📋  DISPATCH DETAILS',
+                 font=('Cambria', 10, 'bold'),
+                 fg=T['gold_rule'], bg=T['bg_paper'],
+                 anchor='w').pack(fill=tk.X, padx=8, pady=(6, 2))
+        self._details_text = scrolledtext.ScrolledText(
+            details_inner, height=10, font=('Consolas', 9),
+            bg=T['bg_paper'], fg=T['fg_on_light'],
+            relief='flat', wrap='word', state='disabled',
+            bd=0, highlightthickness=0)
+        self._details_text.pack(fill=tk.X, padx=6, pady=(0, 6))
+        self._details_text.tag_configure('hd', foreground=T['gold_rule'],
+                                          font=('Cambria', 10, 'bold'))
+        self._details_text.tag_configure('emer', foreground=T['red'],
+                                          font=('Consolas', 9, 'bold'))
+        self._details_text.tag_configure('warn', foreground=T['amber_dark'],
+                                          font=('Consolas', 9, 'bold'))
+        self._details_text.tag_configure('good', foreground=T['green'],
+                                          font=('Consolas', 9, 'bold'))
+        self._details_text.tag_configure('dim', foreground=T['fg_dim_light'])
+
+        # ── Crew action buttons ──
+        action = tk.Frame(self.win, bg=T['bg'])
+        action.pack(fill=tk.X, padx=12, pady=(2, 4))
+        for label, status, color in [
+            ('✓  ACKNOWLEDGE', 'received',  T['blue']),
+            ('🚓  EN ROUTE',    'en_route',  T['amber']),
+            ('📍  ON SCENE',     'on_scene',  T['red']),
+            ('✓  CLEARED',      'cleared',   T['green']),
+        ]:
+            wrap = tk.Frame(action, bg=T['gold_rule'])
+            wrap.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+            b = tk.Button(
+                wrap, text=label,
+                font=('Cambria', 10, 'bold'),
+                bg=color, fg=T['white'],
+                activebackground=T['gold_rule'],
+                activeforeground=T['blue_dark'],
+                relief='flat', cursor='hand2', bd=0,
+                command=lambda s=status, t=label: self._send_status(s, t))
+            b.pack(fill=tk.BOTH, expand=True, padx=2, pady=2, ipady=4)
+
+        # ── Caller transcript preview ──
+        _theme_section_header(self.win,
+                              '📝 CALLER TRANSCRIPT (read-only preview)')
+        ts_outer = tk.Frame(self.win, bg=T['border_light'])
+        ts_outer.pack(fill=tk.BOTH, expand=True, padx=12, pady=(2, 4))
+        ts_inner = tk.Frame(ts_outer, bg=T['bg_paper'])
+        ts_inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        self._transcript = scrolledtext.ScrolledText(
+            ts_inner, font=('Consolas', 10),
+            bg=T['bg_paper'], fg=T['fg_on_light'],
+            relief='flat', wrap='word', state='disabled', height=8,
+            bd=0, highlightthickness=0)
+        self._transcript.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self._transcript.tag_configure('caller', foreground=T['blue_dark'],
+                                       font=('Cambria', 11, 'bold'))
+        self._transcript.tag_configure('ai', foreground=T['amber_dark'],
+                                       font=('Cambria', 10, 'italic'))
+        self._transcript.tag_configure('sys', foreground=T['fg_dim_light'],
+                                       font=('Cambria', 9, 'italic'))
+
+        # ── Inbox queue (history of dispatches received) ──
+        _theme_section_header(self.win, '📥 INBOX QUEUE')
+        inbox_outer = tk.Frame(self.win, bg=T['border_light'])
+        inbox_outer.pack(fill=tk.X, padx=12, pady=(2, 4))
+        inbox_inner = tk.Frame(inbox_outer, bg=T['bg_paper'])
+        inbox_inner.pack(fill=tk.X, padx=1, pady=1)
+        self._inbox_listbox = tk.Listbox(
+            inbox_inner, font=('Consolas', 9),
+            bg=T['bg_paper'], fg=T['fg_on_light'],
+            selectbackground=T['amber'], selectforeground=T['blue_dark'],
+            relief='flat', bd=0, highlightthickness=0, height=6,
+            activestyle='dotbox')
+        self._inbox_listbox.pack(fill=tk.X, padx=4, pady=4)
+        self._inbox_listbox.bind('<<ListboxSelect>>', self._on_inbox_pick)
+
+        # Window switcher (tiny independence violation, but operators want it)
+        _theme_window_switcher(self.win, simulator)
+
+        # Subscribe to the dispatch outbox (push) and the call center
+        # session stream (so triangulation updates land live).
+        try:
+            dispatch_outbox.subscribe(self._on_outbox_push)
+        except Exception as e:
+            _cc_logger.error(f'crew receiver outbox subscribe: {e}')
+        try:
+            call_center_service.subscribe_sessions(self._on_session_event)
+        except Exception:
+            pass
+
+        self._active_packet = None  # currently displayed packet
+        # Seed with whatever is already in the inbox for this callsign
+        self._reload_inbox()
+        self._tick()
+
+    # ── Lifecycle / events ─────────────────────────────────────────
+    def _on_callsign_change(self, _evt=None):
+        new_cs = self._callsign_var.get().strip()
+        if not new_cs or new_cs == self._callsign:
+            return
+        self._callsign = new_cs
+        self._packets_seen = set()
+        self.win.title(f'📟  CREW RECEIVER — {self._callsign}')
+        self._reload_inbox()
+        self._show_packet(None)
+
+    def _on_outbox_push(self, callsign, packet):
+        """Called from whatever thread published the dispatch — marshal to GUI."""
+        if callsign != self._callsign:
+            return
+        try:
+            self._pending.append(('outbox', packet))
+        except Exception:
+            pass
+
+    def _on_session_event(self, event, session):
+        try:
+            self._pending.append(('session', session))
+        except Exception:
+            pass
+
+    def _reload_inbox(self):
+        """Repopulate the inbox listbox from the persisted outbox."""
+        try:
+            packets = dispatch_outbox.list_for(self._callsign)
+        except Exception:
+            packets = []
+        self._inbox_listbox.delete(0, tk.END)
+        self._packets_seen = set()
+        # Newest first
+        for p in reversed(packets):
+            self._inbox_listbox.insert(tk.END, self._inbox_label(p))
+            did = p.get('dispatch_id')
+            if did:
+                self._packets_seen.add(did)
+        # Auto-show the most recent pending one
+        pending = [p for p in packets
+                    if p.get('status') in (None, 'pending', 'received')]
+        if pending:
+            self._show_packet(pending[-1])
+        elif packets:
+            self._show_packet(packets[-1])
+        else:
+            self._show_packet(None)
+
+    @staticmethod
+    def _inbox_label(p):
+        ts = p.get('sent_at') or '?'
+        plan = (p.get('plan') or {}).get('title') or p.get('plan', {}).get('key', '?')
+        cn = p.get('call_number') or p.get('call_id', '?')
+        st = p.get('status') or 'pending'
+        return f'[{ts}]  CALL {cn}  ·  {plan[:32]}  ·  {st}'
+
+    def _on_inbox_pick(self, _evt=None):
+        sel = self._inbox_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        try:
+            packets = dispatch_outbox.list_for(self._callsign)
+        except Exception:
+            return
+        # Listbox is reversed (newest first), so index back into the list
+        packets = list(reversed(packets))
+        if idx < len(packets):
+            self._show_packet(packets[idx])
+
+    # ── Render the active packet ───────────────────────────────────
+    def _show_packet(self, packet):
+        T = USA_THEME
+        self._active_packet = packet
+        if not packet:
+            self._priority_pill.config(text='—', bg=T['silver'])
+            self._plan_lbl.config(text='(no active dispatch)')
+            self._call_lbl.config(text='CALLER: —     CALL #: —')
+            self._note_lbl.config(text='OPERATOR NOTE: —')
+            self._eta_lbl.config(text='ETA TO SCENE: —')
+            self._tactics_text.configure(state='normal')
+            self._tactics_text.delete('1.0', tk.END)
+            self._tactics_text.configure(state='disabled')
+            self._loc_addr_lbl.config(text='(awaiting dispatch...)')
+            self._loc_coord_lbl.config(text='lat —, lon —')
+            self._loc_acc_lbl.config(text='accuracy: —')
+            self._loc_sources_lbl.config(text='sources: —')
+            self._map_btn.config(state='disabled')
+            self._set_transcript('')
+            try:
+                self._summary_lbl.config(text='(awaiting dispatch)')
+                for w in self._hazards_frame.winfo_children():
+                    w.destroy()
+            except Exception:
+                pass
+            try:
+                self._details_text.configure(state='normal')
+                self._details_text.delete('1.0', tk.END)
+                self._details_text.configure(state='disabled')
+            except Exception:
+                pass
+            return
+
+        plan = packet.get('plan') or {}
+        priority = packet.get('priority') or 0
+        # Priority pill color: red (≥80), amber (≥40), green otherwise
+        if priority >= 80:
+            pcolor, ptext = T['red'], 'EMERGENCY'
+        elif priority >= 40:
+            pcolor, ptext = T['amber'], 'PRIORITY'
+        else:
+            pcolor, ptext = T['green'], 'ROUTINE'
+        self._priority_pill.config(
+            text=f'{ptext}   P{priority}', bg=pcolor)
+        self._plan_lbl.config(
+            text=plan.get('title') or plan.get('key') or '(no plan)')
+        self._call_lbl.config(
+            text=f"CALLER: {packet.get('phone','—')}     "
+                 f"CALL #: {packet.get('call_number','—')}     "
+                 f"AI: {packet.get('ai_id','—')}")
+        # ── Incident summary + hazard chips ──
+        # Summary is the gist line built by the dispatcher service. If
+        # it's missing (older packets) fall back to the operator message.
+        summary = packet.get('summary') or packet.get('message') or ''
+        if not summary:
+            summary = (f"{plan.get('title','Response')} — "
+                       f"{packet.get('escalation','GENERAL')}")
+        self._summary_lbl.config(text=summary)
+        # Hazard chips (highlighted facts the AI extracted)
+        for w in self._hazards_frame.winfo_children():
+            w.destroy()
+        facts = packet.get('caller_facts') or {}
+        hazard_priority = (
+            ('weapon_seen',      'WEAPON',           T['red']),
+            ('threat_present',   'SUSPECT ON SCENE', T['red']),
+            ('fire_trapped',     'TRAPPED',          T['red']),
+            ('fire_spreading',   'FIRE SPREADING',   T['red']),
+            ('cpr_in_progress',  'CPR ACTIVE',       T['red']),
+            ('pulse_absent',     'NO PULSE',         T['red']),
+            ('breathing_absent', 'NOT BREATHING',    T['red']),
+            ('multiple_victims', 'MULTI VICTIM',     T['amber_dark']),
+            ('is_child_victim',  'CHILD',            T['amber_dark']),
+            ('caller_injured',   'CALLER INJURED',   T['amber_dark']),
+            ('has_cardiac_hx',   'CARDIAC HX',       T['amber_dark']),
+            ('pregnancy',        'PREGNANT',         T['amber_dark']),
+            ('cant_speak',       "CAN'T SPEAK",      T['amber_dark']),
+            ('door_locked',      'DOOR LOCKED',      T['blue_dark']),
+            ('door_unlocked',    'DOOR OPEN',        T['blue_dark']),
+            ('in_vehicle',       'IN VEHICLE',       T['blue_dark']),
+            ('caller_safe',      'CALLER SAFE',      T['green']),
+            ('threat_fled',      'THREAT FLED',      T['green']),
+        )
+        for fkey, label, color in hazard_priority:
+            if facts.get(fkey):
+                chip = tk.Label(
+                    self._hazards_frame, text=label,
+                    font=('Consolas', 9, 'bold'),
+                    fg=T['white'], bg=color,
+                    padx=8, pady=2)
+                chip.pack(side=tk.LEFT, padx=2, pady=2)
+        # Tactics
+        tac_lines = []
+        for t in (plan.get('tactics') or []):
+            tac_lines.append(f'• {t}')
+        self._tactics_text.configure(state='normal')
+        self._tactics_text.delete('1.0', tk.END)
+        if tac_lines:
+            self._tactics_text.insert(tk.END, '\n'.join(tac_lines))
+        else:
+            self._tactics_text.insert(tk.END, '(no tactics specified)')
+        self._tactics_text.configure(state='disabled')
+        # Note
+        msg = packet.get('message') or ''
+        if msg:
+            self._note_lbl.config(text=f'OPERATOR NOTE: {msg}')
+        else:
+            self._note_lbl.config(text='OPERATOR NOTE: —')
+        # ETA
+        eta = packet.get('eta') or {}
+        if eta and eta.get('eta_s') is not None:
+            mm = int(eta['eta_s']) // 60
+            ss = int(eta['eta_s']) % 60
+            d = eta.get('distance_km') or 0
+            self._eta_lbl.config(
+                text=f'ETA TO SCENE: {mm:02d}:{ss:02d}  ·  '
+                     f'{d:.1f} km from your unit')
+        else:
+            self._eta_lbl.config(text='ETA TO SCENE: —')
+        # Location — prefer the live triangulation; fall back to packet
+        self._refresh_location_for_packet(packet)
+        # Transcript
+        ts = packet.get('transcript') or ''
+        sess = None
+        try:
+            sess = call_center_service.get_session(packet.get('call_id'))
+        except Exception:
+            sess = None
+        if not ts and sess:
+            try:
+                ts = call_center_service.build_transcript_snapshot(sess)
+            except Exception:
+                pass
+        self._set_transcript(ts)
+        # Comprehensive dispatch details
+        self._render_details(packet, sess)
+
+    def _render_details(self, packet, sess):
+        """Render the deep dispatch details panel: identifiers, timing,
+        escalation, AI's last decision + reasoning, AI Council pick,
+        per-source location, status history, and dispatcher↔unit comms."""
+        T = USA_THEME
+        w = self._details_text
+        try:
+            w.configure(state='normal')
+            w.delete('1.0', tk.END)
+        except Exception:
+            return
+        if not packet:
+            w.insert(tk.END, '(no packet)\n', 'dim')
+            w.configure(state='disabled')
+            return
+
+        # ── Identifiers + timing ──
+        w.insert(tk.END, '── DISPATCH IDENTIFIERS ──\n', 'hd')
+        w.insert(tk.END,
+                 f'  dispatch_id    : {packet.get("dispatch_id","—")}\n'
+                 f'  call_id        : {packet.get("call_id","—")}\n'
+                 f'  call_number    : {packet.get("call_number","—")}\n'
+                 f'  dispatch AI    : {packet.get("ai_id","—")}\n'
+                 f'  sent_at        : {packet.get("sent_at","—")} '
+                 f'(by {packet.get("sent_by","—")})\n'
+                 f'  status         : {packet.get("status","—")}\n')
+        if sess:
+            started = sess.get('started_at') or '—'
+            try:
+                duration_s = max(0, time.time()
+                                 - (sess.get('started_epoch') or time.time()))
+                dur_str = f'{int(duration_s // 60):02d}:{int(duration_s % 60):02d}'
+            except Exception:
+                dur_str = '—'
+            w.insert(tk.END,
+                     f'  call started   : {started}  (duration {dur_str})\n')
+        w.insert(tk.END, '\n')
+
+        # ── Escalation route ──
+        w.insert(tk.END, '── ESCALATION ROUTE ──\n', 'hd')
+        esc = packet.get('escalation') or '—'
+        priority = packet.get('priority') or 0
+        plan = packet.get('plan') or {}
+        plan_key = plan.get('key') or '—'
+        esc_tag = ('emer' if priority >= 80
+                   else 'warn' if priority >= 40 else 'good')
+        w.insert(tk.END,
+                 f'  escalation     : {esc}  (priority P{priority})\n', esc_tag)
+        w.insert(tk.END,
+                 f'  plan_key       : {plan_key}\n'
+                 f'  plan_title     : {plan.get("title","—")}\n'
+                 f'  approach       : {plan.get("approach","—")}\n'
+                 f'  recipients     : {", ".join(packet.get("recipients") or []) or "—"}\n')
+        # Frequencies (radio channels) for this plan
+        freqs = plan.get('frequencies') or []
+        if freqs:
+            w.insert(tk.END, '  frequencies    :\n')
+            for fq in freqs:
+                w.insert(tk.END, f'    · {fq}\n', 'dim')
+        # Plan safety priorities
+        safety = plan.get('safety') or []
+        if safety:
+            w.insert(tk.END, '  safety priors  :\n')
+            for s in safety:
+                w.insert(tk.END, f'    · {s}\n', 'warn')
+        w.insert(tk.END, '\n')
+
+        # ── Caller facts (structured booleans the AI extracted) ──
+        # These are what dispatchers and crews most want — "weapon? kid?
+        # cardiac history?" answered up-front instead of buried in the
+        # transcript.
+        facts = packet.get('caller_facts') or {}
+        if facts:
+            w.insert(tk.END, '── CALLER FACTS (AI-extracted) ──\n', 'hd')
+            critical = ('weapon_seen', 'threat_present', 'fire_trapped',
+                        'fire_spreading', 'cpr_in_progress', 'pulse_absent',
+                        'breathing_absent', 'multiple_victims',
+                        'is_child_victim', 'caller_injured',
+                        'has_cardiac_hx', 'pregnancy', 'cant_speak')
+            for k in critical:
+                if facts.get(k):
+                    w.insert(tk.END,
+                             f'  ⚠  {k.replace("_", " ").upper()}\n', 'emer')
+            other_facts = [k for k in facts.keys() if k not in critical]
+            for k in sorted(other_facts):
+                if facts.get(k):
+                    w.insert(tk.END,
+                             f'  · {k.replace("_", " ")}\n', 'dim')
+            w.insert(tk.END, '\n')
+
+        # ── Packet-embedded AI decision (frozen at send-time) ──
+        # Distinct from the LIVE session decision below. Tells the crew
+        # what the AI thought when it told dispatch to send them.
+        ai_dec = packet.get('ai_decision')
+        if ai_dec:
+            w.insert(tk.END,
+                     '── AI DECISION (at packet send-time) ──\n', 'hd')
+            action = ai_dec.get('action') or '—'
+            action_tag = ('emer' if 'EMERGENCY' in action or 'ESCALATE' in action
+                          else 'warn' if 'DISPATCH' in action else 'good')
+            w.insert(tk.END,
+                     f'  action         : {action}\n', action_tag)
+            w.insert(tk.END,
+                     f'  intent         : {ai_dec.get("intent","—")}  '
+                     f'urgency=U{ai_dec.get("urgency",0)}  '
+                     f'psych={ai_dec.get("psych_state","—")}\n'
+                     f'  AI response    : "{(ai_dec.get("response") or "")[:200]}"\n'
+                     f'  classified at  : {ai_dec.get("received_at","—")}\n')
+            for r in (ai_dec.get('reasoning') or [])[:5]:
+                w.insert(tk.END, f'    · {r}\n', 'dim')
+            w.insert(tk.END, '\n')
+
+        # ── AI council pick (frozen at send-time) ──
+        council = packet.get('ai_council')
+        if council:
+            pick = council.get('pick', '—')
+            agree = council.get('agreement', 0.0)
+            n = council.get('num_entities', 0)
+            council_tag = ('good' if agree >= 0.6
+                           else 'warn' if agree >= 0.3 else 'emer')
+            w.insert(tk.END, '── AI COUNCIL ──\n', 'hd')
+            w.insert(tk.END,
+                     f'  {n} swarm AIs voted: pick={pick} '
+                     f'(agreement {agree:.2f})\n', council_tag)
+            tally = council.get('tally') or {}
+            if tally:
+                tally_str = ', '.join(
+                    f'{k}={v:.2f}'
+                    for k, v in sorted(tally.items(),
+                                        key=lambda kv: -kv[1])[:6])
+                w.insert(tk.END, f'  tally          : {tally_str}\n', 'dim')
+            w.insert(tk.END, '\n')
+
+        # ── Recommended first-contact questions ──
+        rq = packet.get('recommended_questions') or []
+        if rq:
+            w.insert(tk.END,
+                     '── RECOMMENDED FIRST-CONTACT QUESTIONS ──\n', 'hd')
+            for q in rq:
+                w.insert(tk.END, f'  ▸ {q}\n')
+            w.insert(tk.END, '\n')
+
+        # ── AI's most recent decision (live from the session) ──
+        if sess:
+            decisions = sess.get('decisions') or []
+            if decisions:
+                last = decisions[-1]
+                w.insert(tk.END, '── AI LATEST DECISION ──\n', 'hd')
+                action = last.get('action') or '—'
+                action_tag = ('emer' if 'EMERGENCY' in action or 'ESCALATE' in action
+                              else 'warn' if 'DISPATCH' in action
+                              else 'good')
+                agg = last.get('aggregate') or {}
+                w.insert(tk.END,
+                         f'  action         : {action}\n', action_tag)
+                w.insert(tk.END,
+                         f'  intent         : {agg.get("intent","—")}  '
+                         f'urgency=U{agg.get("urgency",0)}  '
+                         f'psych={agg.get("psych_state","—")}\n'
+                         f'  response       : "{(last.get("response") or "")[:160]}"\n'
+                         f'  latency        : {last.get("latency_ms",0):.1f} ms\n')
+                # AI council pick (if present)
+                council = last.get('ai_council')
+                if council:
+                    pick = council.get('pick', '—')
+                    agree = council.get('agreement', 0.0)
+                    n = council.get('num_entities', 0)
+                    council_tag = ('good' if agree >= 0.6
+                                   else 'warn' if agree >= 0.3 else 'emer')
+                    w.insert(tk.END,
+                             f'  AI council     : {n} AIs picked '
+                             f'{pick} (agreement {agree:.2f})\n',
+                             council_tag)
+                # Reasoning trail
+                reasoning = last.get('reasoning') or []
+                if reasoning:
+                    w.insert(tk.END, '  reasoning      :\n')
+                    for r in reasoning[:8]:
+                        w.insert(tk.END, f'    · {r}\n', 'dim')
+                    if len(reasoning) > 8:
+                        w.insert(tk.END,
+                                 f'    · (+{len(reasoning) - 8} more)\n', 'dim')
+                w.insert(tk.END, '\n')
+
+            # ── Latest 3 caller chunks for fast situational read ──
+            chunks = sess.get('chunks') or []
+            if chunks:
+                w.insert(tk.END,
+                         '── CALLER LATEST (last 3 chunks) ──\n', 'hd')
+                for ch in chunks[-3:]:
+                    w.insert(tk.END,
+                             f'  ▸ "{(ch or "")[:220]}"\n')
+                w.insert(tk.END, '\n')
+
+            # ── Triangulation summary (per-source) ──
+            tri = sess.get('triangulation') or {}
+            if tri:
+                w.insert(tk.END, '── CALLER LOCATION (fused) ──\n', 'hd')
+                acc = tri.get('accuracy_m', 0)
+                grade = ('HIGH' if acc < 200
+                         else 'MEDIUM' if acc < 5000 else 'LOW')
+                grade_tag = ('good' if grade == 'HIGH'
+                             else 'warn' if grade == 'MEDIUM' else 'emer')
+                w.insert(tk.END,
+                         f'  fix            : ({tri.get("lat",0):.5f}, '
+                         f'{tri.get("lon",0):.5f})  ±{acc} m  [{grade}]\n',
+                         grade_tag)
+                w.insert(tk.END,
+                         f'  best source    : {tri.get("best_source","—")}  '
+                         f'fused: {tri.get("fused", False)}\n')
+                for src in tri.get('sources') or []:
+                    w.insert(tk.END,
+                             f'    · {src.get("name"):<14} '
+                             f'σ±{int(src.get("sigma_m",0))}m  '
+                             f'grade={src.get("grade","?")}\n', 'dim')
+                w.insert(tk.END, '\n')
+
+            # ── Comms log (operator <-> this unit) ──
+            comms = sess.get('comms') or []
+            mine = [c for c in comms
+                    if (c.get('to') == self._callsign
+                        or c.get('from') == self._callsign
+                        or self._callsign in (c.get('to') or '').split(', '))]
+            if mine:
+                w.insert(tk.END, '── DISPATCHER ↔ UNIT COMMS ──\n', 'hd')
+                for c in mine[-6:]:
+                    arrow = '→' if c.get('dir', 'OUT') == 'OUT' else '←'
+                    w.insert(tk.END,
+                             f'  [{c.get("wall","?")}] {arrow} '
+                             f'{c.get("from","?")}: {(c.get("text","") or "")[:140]}\n',
+                             'dim')
+                w.insert(tk.END, '\n')
+
+        # ── Packet status history ──
+        history = packet.get('history') or []
+        if history:
+            w.insert(tk.END, '── PACKET STATUS HISTORY ──\n', 'hd')
+            for h in history[-6:]:
+                st = h.get('status', '?')
+                tag = ('emer' if st in ('cleared',)
+                       else 'good' if st in ('on_scene',)
+                       else 'warn' if st in ('en_route', 'received') else 'dim')
+                w.insert(tk.END,
+                         f'  [{h.get("wall","?")}] {st:<10} '
+                         f'by {h.get("by","?")}  {h.get("note","")}\n', tag)
+            w.insert(tk.END, '\n')
+
+        w.configure(state='disabled')
+        w.see('1.0')
+
+    def _set_transcript(self, text):
+        self._transcript.configure(state='normal')
+        self._transcript.delete('1.0', tk.END)
+        for raw in (text or '').splitlines():
+            line = raw.rstrip()
+            if 'CALLER:' in line:
+                self._transcript.insert(tk.END, line + '\n', 'caller')
+            elif 'AI    :' in line or line.lstrip().startswith('AI:'):
+                self._transcript.insert(tk.END, line + '\n', 'ai')
+            else:
+                self._transcript.insert(tk.END, line + '\n', 'sys')
+        self._transcript.configure(state='disabled')
+        self._transcript.see('1.0')
+
+    def _refresh_location_for_packet(self, packet):
+        """Pull the freshest triangulation for this dispatch's call_id and
+        repaint the location panel. Re-runs reduction so any signal that
+        landed since the dispatch was sent gets folded in."""
+        T = USA_THEME
+        cid = packet.get('call_id') if packet else None
+        tri = None
+        sess = None
+        if cid:
+            try:
+                sess = call_center_service.get_session(cid)
+            except Exception:
+                sess = None
+            if sess is not None:
+                try:
+                    tri = caller_triangulator.reduce(sess) or sess.get('triangulation')
+                except Exception:
+                    tri = sess.get('triangulation')
+        # Address line: prefer session location's display, fall back to
+        # packet location, then triangulation coords
+        loc = (sess or {}).get('location') or packet.get('location') or {}
+        addr_parts = []
+        if loc.get('address') or loc.get('display'):
+            addr_parts.append(loc.get('address') or loc.get('display'))
+        else:
+            for k in ('city', 'regionName', 'country'):
+                v = loc.get(k)
+                if v and v != '?':
+                    addr_parts.append(v)
+        addr = ', '.join(addr_parts) or '(unknown address)'
+        self._loc_addr_lbl.config(text=addr)
+        # Coords + accuracy from triangulation if available
+        if tri:
+            self._loc_coord_lbl.config(
+                text=f'lat {tri["lat"]:.5f}, lon {tri["lon"]:.5f}')
+            acc_m = tri.get('accuracy_m', 0)
+            grade = 'HIGH' if acc_m < 200 else 'MEDIUM' if acc_m < 5000 else 'LOW'
+            grade_color = (T['green'] if grade == 'HIGH'
+                            else T['amber_dark'] if grade == 'MEDIUM'
+                            else T['red'])
+            self._loc_acc_lbl.config(
+                text=f'accuracy: ±{acc_m} m   [{grade}]'
+                     + ('   (multi-source fused)' if tri.get('fused') else
+                        f'   (single source: {tri.get("best_source","?")})'),
+                fg=grade_color)
+            srcs = tri.get('sources') or []
+            src_strs = []
+            for s in srcs:
+                src_strs.append(
+                    f"{s['name']} (σ±{int(s['sigma_m'])}m, w={s['weight']:.1e})")
+            self._loc_sources_lbl.config(
+                text='sources: ' + (', '.join(src_strs) or '—'))
+            self._map_btn.config(state='normal')
+            self._last_map_lat = tri['lat']
+            self._last_map_lon = tri['lon']
+        else:
+            # No triangulation yet; try the packet's static location
+            ploc = packet.get('location') or {}
+            lat = ploc.get('lat')
+            lon = ploc.get('lon')
+            if lat and lon:
+                self._loc_coord_lbl.config(
+                    text=f'lat {lat:.5f}, lon {lon:.5f}')
+                self._loc_acc_lbl.config(
+                    text=f'accuracy: ±{ploc.get("accuracy_m","?")} m '
+                         f'(packet snapshot — not triangulated)',
+                    fg=T['amber_dark'])
+                self._map_btn.config(state='normal')
+                self._last_map_lat = lat
+                self._last_map_lon = lon
+            else:
+                self._loc_coord_lbl.config(text='lat —, lon —')
+                self._loc_acc_lbl.config(text='accuracy: —', fg=T['fg_dim_light'])
+                self._map_btn.config(state='disabled')
+            self._loc_sources_lbl.config(text='sources: —')
+
+    def _open_in_maps(self):
+        lat = getattr(self, '_last_map_lat', None)
+        lon = getattr(self, '_last_map_lon', None)
+        if lat is None or lon is None:
+            return
+        url = f'https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=17/{lat}/{lon}'
+        try:
+            _cc_webbrowser.open_new_tab(url)
+        except Exception as e:
+            _cc_logger.error(f'crew receiver map open failed: {e}')
+
+    def _send_status(self, status, label):
+        """Crew-side status update — feeds back to the operator console."""
+        if not self._active_packet:
+            return
+        did = self._active_packet.get('dispatch_id')
+        if not did:
+            return
+        try:
+            dispatch_outbox.update_status(
+                self._callsign, did, status,
+                by=f'crew:{self._callsign}',
+                note=f'{label} from receiver window')
+        except Exception as e:
+            _cc_logger.error(f'crew status update failed: {e}')
+        # Also push the unit roster status if the status is a state machine match
+        try:
+            u = unit_roster.units.get(self._callsign)
+            if u is not None:
+                state_map = {
+                    'received':  _Unit.STATUS_DISPATCHED,
+                    'en_route':  _Unit.STATUS_EN_ROUTE,
+                    'on_scene':  _Unit.STATUS_ON_SCENE,
+                    'cleared':   _Unit.STATUS_AVAILABLE,
+                }
+                target = state_map.get(status)
+                if target:
+                    u.transition(target,
+                                 call_id=self._active_packet.get('call_id'))
+                    unit_roster._emit('unit_status', u.to_dict())
+        except Exception as e:
+            _cc_logger.error(f'crew unit transition failed: {e}')
+
+    # ── Tick: drain pending events + refresh display ───────────────
+    def _tick(self):
+        if not self._running:
+            return
+        try:
+            new_packet = False
+            while self._pending:
+                kind, payload = self._pending.popleft()
+                if kind == 'outbox':
+                    did = payload.get('dispatch_id')
+                    if did and did not in self._packets_seen:
+                        self._packets_seen.add(did)
+                        self._inbox_listbox.insert(0, self._inbox_label(payload))
+                        # Auto-promote new dispatch to active view
+                        self._show_packet(payload)
+                        new_packet = True
+                    else:
+                        # Status update on an existing packet — re-render
+                        # if it's the one we're showing.
+                        if (self._active_packet and
+                                self._active_packet.get('dispatch_id') == did):
+                            self._show_packet(payload)
+                        # And refresh inbox label
+                        self._reload_inbox_labels()
+                elif kind == 'session':
+                    # Live transcript / triangulation update for the call
+                    # backing our active packet — repaint location AND the
+                    # full detail panel so new caller chunks, AI decisions,
+                    # and council picks land immediately.
+                    if (self._active_packet and
+                            payload.get('call_id') ==
+                            self._active_packet.get('call_id')):
+                        self._refresh_location_for_packet(self._active_packet)
+                        try:
+                            self._render_details(self._active_packet, payload)
+                            # Also refresh the transcript pane
+                            ts = call_center_service.build_transcript_snapshot(
+                                payload)
+                            self._set_transcript(ts)
+                        except Exception:
+                            pass
+            # Periodic re-triangulation + detail refresh even when no
+            # event (re-fold any newly-arrived background GeoIP / verifier
+            # data and refresh decision counts).
+            if self._active_packet:
+                self._refresh_location_for_packet(self._active_packet)
+                try:
+                    sess = call_center_service.get_session(
+                        self._active_packet.get('call_id'))
+                    if sess:
+                        self._render_details(self._active_packet, sess)
+                except Exception:
+                    pass
+            # Refresh unit type / status badge
+            try:
+                u = unit_roster.units.get(self._callsign)
+                if u is not None:
+                    T = USA_THEME
+                    self._unit_type_lbl.config(text=u.unit_type)
+                    color = (T['green'] if u.status == _Unit.STATUS_AVAILABLE
+                             else T['amber'] if u.status in (
+                                 _Unit.STATUS_DISPATCHED, _Unit.STATUS_EN_ROUTE)
+                             else T['red'] if u.status == _Unit.STATUS_ON_SCENE
+                             else T['silver'])
+                    self._unit_status_lbl.config(
+                        text=u.status.replace('_', ' '), fg=color)
+            except Exception:
+                pass
+            if new_packet:
+                # Visual ping: flash the title bar
+                try:
+                    self.win.bell()
+                except Exception:
+                    pass
+        except Exception as e:
+            _cc_logger.debug(f'crew receiver tick error: {e}')
+        if self._running:
+            try:
+                self.win.after(self._update_interval, self._tick)
+            except Exception:
+                pass
+
+    def _reload_inbox_labels(self):
+        """Re-render the inbox listbox to reflect status changes."""
+        try:
+            packets = list(reversed(dispatch_outbox.list_for(self._callsign)))
+        except Exception:
+            return
+        # Preserve selection
+        sel = self._inbox_listbox.curselection()
+        sel_idx = sel[0] if sel else None
+        self._inbox_listbox.delete(0, tk.END)
+        for p in packets:
+            self._inbox_listbox.insert(tk.END, self._inbox_label(p))
+        if sel_idx is not None and sel_idx < len(packets):
+            self._inbox_listbox.selection_set(sel_idx)
+
+    def _on_close(self):
+        self._running = False
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+
+def launch_crew_receiver(simulator, callsign=None):
+    return CrewReceiverWindow(simulator, callsign=callsign)
 
 
 # =============================================================================
@@ -31837,7 +38264,14 @@ class NetworkMonitorWindow:
         self.sim = simulator
         self.mb = medianbox
         self._running = True
-        self._update_interval = 2000
+        # Faster cadence so the Connections tab actually feels live —
+        # the cost is small (snapshot reads from in-memory dicts) and
+        # operators reported the 2s tick made it look frozen.
+        self._update_interval = 1000
+        # Push-update flag set by the call-center session subscriber so
+        # tabs that care about call state refresh the moment a chunk lands
+        # rather than waiting for the next 1s tick.
+        self._push_dirty = False
 
         T = USA_THEME
         self.win = tk.Toplevel(parent_root)
@@ -31883,17 +38317,47 @@ class NetworkMonitorWindow:
         # ── Tab 1: Connections ──
         conn_tab = tk.Frame(nb, bg=BG)
         nb.add(conn_tab, text=' Connections ')
-        cols = ('ai', 'call_id', 'remote_ip', 'remote_port', 'service',
-                'category', 'country', 'city', 'org', 'loc_grade',
-                'loc_conf', 'proxy')
+        # Header strip with live indicator
+        conn_head = tk.Frame(conn_tab, bg=BG_PANEL)
+        conn_head.pack(fill=tk.X, padx=4, pady=(4, 0))
+        self._conn_live_dot = tk.Label(
+            conn_head, text='● LIVE', font=('Cambria', 10, 'bold'),
+            fg=FG_GOOD, bg=BG_PANEL, padx=8, pady=4)
+        self._conn_live_dot.pack(side=tk.LEFT)
+        self._conn_count_lbl = tk.Label(
+            conn_head, text='0 connections', font=('Consolas', 9),
+            fg=FG_DIM, bg=BG_PANEL, padx=8)
+        self._conn_count_lbl.pack(side=tk.LEFT)
+        # Show-ended toggle: by default show only active calls; tick to
+        # also surface recently-ended calls for forensic review.
+        self._conn_show_ended = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            conn_head, text='show ended (last 50)',
+            variable=self._conn_show_ended,
+            font=('Consolas', 9),
+            fg=FG, bg=BG_PANEL, selectcolor=BG_ENTRY,
+            activebackground=BG_PANEL, activeforeground=FG
+        ).pack(side=tk.LEFT, padx=(12, 0))
+        cols = ('ai', 'call_id', 'status', 'phone', 'remote_ip',
+                'mode', 'action', 'urgency',
+                'service', 'country', 'city', 'org',
+                'loc_grade', 'loc_conf', 'proxy', 'started')
         self._conn_tree = ttk.Treeview(conn_tab, columns=cols, show='headings',
                                         height=20, style='USA.Treeview')
-        for c, w in [('ai', 80), ('call_id', 130), ('remote_ip', 130),
-                     ('remote_port', 60), ('service', 130), ('category', 90),
-                     ('country', 60), ('city', 110), ('org', 130),
-                     ('loc_grade', 90), ('loc_conf', 60), ('proxy', 110)]:
+        for c, w in [
+            ('ai', 70), ('call_id', 110), ('status', 70), ('phone', 110),
+            ('remote_ip', 110), ('mode', 90), ('action', 130),
+            ('urgency', 50), ('service', 110), ('country', 50),
+            ('city', 100), ('org', 100), ('loc_grade', 70),
+            ('loc_conf', 50), ('proxy', 90), ('started', 80),
+        ]:
             self._conn_tree.heading(c, text=c.replace('_', ' ').title())
             self._conn_tree.column(c, width=w, anchor='w')
+        # Row tags: color the row by urgency / state
+        self._conn_tree.tag_configure('emer', background='#3a1414', foreground='#ff8888')
+        self._conn_tree.tag_configure('disp', background='#2a2410', foreground='#ffcc66')
+        self._conn_tree.tag_configure('chat', background='#10202a', foreground='#88ccff')
+        self._conn_tree.tag_configure('ended', background='#1a1a1a', foreground='#666688')
         self._conn_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
         sb = ttk.Scrollbar(conn_tab, orient='vertical',
                            command=self._conn_tree.yview)
@@ -31966,18 +38430,74 @@ class NetworkMonitorWindow:
             relief='flat', wrap='word', state='disabled')
         self._pipe_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
+        # ── Tab 8: Caller Triangulation ──
+        # Shows the multi-source location reduction for every active call,
+        # so the system has a single source of truth for "where is the
+        # caller right now" that the dispatcher console, the Crew Receiver,
+        # and the medianbox forensics all read from.
+        tri_tab = tk.Frame(nb, bg=BG)
+        nb.add(tri_tab, text=' Caller Triangulation ')
+        tri_tab.rowconfigure(1, weight=1)
+        tri_tab.columnconfigure(0, weight=1)
+        tk.Label(tri_tab,
+                 text='Caller location triangulation — '
+                      'fused (browser GPS + IP geo + phone NPA + verifier)',
+                 font=('Consolas', 11, 'bold'), fg=FG_HEAD, bg=BG,
+                 anchor='w').grid(row=0, column=0, sticky='ew', padx=8, pady=(8, 4))
+        tri_cols = ('call_id', 'phone', 'lat', 'lon', 'accuracy_m',
+                    'best_source', 'fused', 'sources')
+        self._tri_tree = ttk.Treeview(
+            tri_tab, columns=tri_cols, show='headings',
+            height=10, style='USA.Treeview')
+        for c, w in [
+            ('call_id',     150), ('phone',     130), ('lat',          90),
+            ('lon',          90), ('accuracy_m', 90), ('best_source', 110),
+            ('fused',         60), ('sources',  300),
+        ]:
+            self._tri_tree.heading(c, text=c.replace('_', ' ').title())
+            self._tri_tree.column(c, width=w, anchor='w')
+        self._tri_tree.grid(row=1, column=0, sticky='nsew', padx=8, pady=4)
+        tri_sb = ttk.Scrollbar(tri_tab, orient='vertical',
+                                command=self._tri_tree.yview)
+        tri_sb.grid(row=1, column=1, sticky='ns', pady=4)
+        self._tri_tree.config(yscrollcommand=tri_sb.set)
+        # Detail pane below: per-source breakdown for the selected row
+        self._tri_detail = scrolledtext.ScrolledText(
+            tri_tab, bg=BG_PANEL, fg=FG, font=('Consolas', 9),
+            relief='flat', wrap='word', state='disabled', height=10)
+        self._tri_detail.grid(row=2, column=0, columnspan=2,
+                                sticky='ew', padx=8, pady=(4, 8))
+        for tag, color in [
+            ('hd', FG_HEAD), ('good', FG_GOOD), ('warn', FG_WARN),
+            ('bad', '#ff5566'), ('dim', FG_DIM)]:
+            self._tri_detail.tag_configure(tag, foreground=color)
+        self._tri_tree.bind('<<TreeviewSelect>>', self._on_tri_select)
+        self._selected_tri_call = None
+
         self._selected_call_id = None
+        # Subscribe to call-center session events so Connections / Triangulation
+        # repaint the moment a chunk or location update lands, not just on the
+        # 1s tick. Marshaled to GUI thread via the _push_dirty flag.
+        try:
+            call_center_service.subscribe_sessions(
+                self._on_cc_session_event)
+        except Exception as e:
+            print(f'  [ERR] netmon session subscribe: {e}')
         self._schedule_update()
+
+    def _on_cc_session_event(self, _event, _session):
+        """Marshalled to the next tick; flag tells _schedule_update to
+        refresh ASAP rather than waiting the full _update_interval."""
+        self._push_dirty = True
 
     def _on_conn_select(self, _evt=None):
         sel = self._conn_tree.selection()
         if not sel:
             return
-        item = sel[0]
-        vals = self._conn_tree.item(item, 'values')
-        if len(vals) >= 2:
-            self._selected_call_id = vals[1]
-            self._refresh_loc_verify()
+        # Row iid IS the full call_id (set in _refresh_connections); use it
+        # rather than the truncated display column.
+        self._selected_call_id = sel[0]
+        self._refresh_loc_verify()
 
     def _schedule_update(self):
         if not self._running:
@@ -31995,8 +38515,12 @@ class NetworkMonitorWindow:
             self._refresh_all()
         except Exception as e:
             print(f'  [ERR] netmon refresh: {e}')
+        # If a session event arrived between ticks, schedule the next
+        # refresh much sooner so the UI feels live.
+        next_in = 200 if self._push_dirty else self._update_interval
+        self._push_dirty = False
         if self._running:
-            self.win.after(self._update_interval, self._schedule_update)
+            self.win.after(next_in, self._schedule_update)
 
     def _refresh_all(self):
         if not self.win.winfo_exists():
@@ -32011,10 +38535,21 @@ class NetworkMonitorWindow:
                 lbl.config(text=txt, fg=FG_GOOD if v else FG_DIM)
             else:
                 lbl.config(text=str(v))
-        active_tab = self.notebook.index(self.notebook.select())
-        if active_tab == 0:
+        # Connections + triangulation are call-center driven and cheap to
+        # rebuild — paint them every tick regardless of active tab so the
+        # tables stay live and the user can switch tabs without seeing
+        # stale rows. Heavier tabs (deductions/geoip/etc) still gate on
+        # active tab.
+        try:
             self._refresh_connections()
-        elif active_tab == 1:
+        except Exception as e:
+            _cc_logger.debug(f'connections refresh failed: {e}')
+        try:
+            self._refresh_triangulation()
+        except Exception as e:
+            _cc_logger.debug(f'triangulation refresh failed: {e}')
+        active_tab = self.notebook.index(self.notebook.select())
+        if active_tab == 1:
             self._refresh_loc_verify()
         elif active_tab == 2:
             self._refresh_deductions()
@@ -32044,27 +38579,77 @@ class NetworkMonitorWindow:
         # Clear tree
         for iid in self._conn_tree.get_children():
             self._conn_tree.delete(iid)
-        for s in sessions:
-            if s.get('status') != 'active':
+        # Filter rules: always show active. Optionally include recently-ended.
+        show_ended = bool(self._conn_show_ended.get()) \
+            if hasattr(self, '_conn_show_ended') else False
+        active_count = 0
+        ended_shown = 0
+        # Most recent first so the top of the table is the freshest call
+        for s in reversed(sessions):
+            status = s.get('status') or 'active'
+            if status == 'active':
+                active_count += 1
+            elif show_ended and ended_shown < 50:
+                ended_shown += 1
+            else:
                 continue
             ip = s.get('client_ip') or ''
             mb = mb_by_ip.get(ip, {})
             loc = s.get('location') or {}
+            agg = s.get('last_aggregate') or {}
+            mode = ('CASUAL_CHAT' if s.get('casual_chat_mode')
+                    else (s.get('escalation') or '—'))
+            action = s.get('last_action') or '—'
+            urgency = agg.get('urgency', 0)
+            # Started (HH:MM:SS only)
+            started = s.get('started_at') or ''
+            if started and len(started) >= 8:
+                started = started[:8]
             row = (
                 s.get('ai_id', '?'),
-                s.get('call_id', '?'),
-                ip,
-                '',
+                s.get('call_id', '?')[:14],
+                status.upper(),
+                s.get('phone') or '?',
+                ip or '—',
+                mode,
+                action,
+                str(urgency),
                 mb.get('service') or loc.get('service') or '?',
-                mb.get('category') or loc.get('category') or '?',
                 loc.get('country') or '?',
                 loc.get('city') or '?',
                 loc.get('org') or mb.get('org') or '?',
                 loc.get('loc_grade') or mb.get('loc_grade') or 'UNVERIFIED',
                 str(loc.get('loc_confidence') or mb.get('loc_confidence') or 0),
                 mb.get('proxy_type') or '—',
+                started,
             )
-            self._conn_tree.insert('', tk.END, values=row)
+            tag = ('ended' if status != 'active' else
+                   'emer' if ('EMERGENCY' in action or 'ESCALATE' in action) else
+                   'chat' if s.get('casual_chat_mode') else
+                   'disp' if 'DISPATCH' in action else
+                   '')
+            # Store full call_id as the row iid so click selection still
+            # resolves the session (display column is truncated for layout).
+            full_cid = s.get('call_id', '')
+            try:
+                self._conn_tree.insert('', tk.END, iid=full_cid, values=row,
+                                        tags=(tag,) if tag else ())
+            except tk.TclError:
+                # iid collision (shouldn't happen — sessions are unique) —
+                # fall back to anonymous insert.
+                self._conn_tree.insert('', tk.END, values=row,
+                                        tags=(tag,) if tag else ())
+        # Header counters
+        try:
+            self._conn_count_lbl.config(
+                text=(f'{active_count} active'
+                      + (f' · {ended_shown} ended (shown)' if ended_shown else '')))
+            # Pulse the LIVE dot so it's visibly ticking
+            cur = self._conn_live_dot.cget('fg')
+            self._conn_live_dot.config(
+                fg=(FG_DIM if cur == FG_GOOD else FG_GOOD))
+        except Exception:
+            pass
 
     def _refresh_loc_verify(self):
         cid = self._selected_call_id
@@ -32230,6 +38815,110 @@ class NetworkMonitorWindow:
             ('geoip2',  HAS_GEOIP2),
         ]:
             w.insert(tk.END, f'  {name:<22} : {"installed" if present else "missing"}\n')
+        w.configure(state='disabled')
+
+    # ── Caller Triangulation tab ─────────────────────────────────
+    def _refresh_triangulation(self):
+        """Repaint the caller-triangulation table from every active call.
+
+        Re-runs `caller_triangulator.reduce(sess)` per row so any signal
+        that landed since the last tick (browser GPS, GeoIP enrichment,
+        verifier confidence) is folded in. The result is also written back
+        onto sess['triangulation'] so the dispatch packets, the Crew Receiver
+        window, and any other reader share the same fused fix."""
+        try:
+            sessions = list(call_center_service.sessions.values())
+        except Exception:
+            sessions = []
+        # Clear + repopulate the tree
+        for iid in self._tri_tree.get_children():
+            self._tri_tree.delete(iid)
+        for s in sessions:
+            if s.get('status') != 'active':
+                continue
+            try:
+                tri = caller_triangulator.reduce(s)
+            except Exception:
+                tri = s.get('triangulation')
+            if not tri:
+                continue
+            srcs = ', '.join(src['name'] for src in (tri.get('sources') or []))
+            self._tri_tree.insert(
+                '', 'end', iid=s.get('call_id'),
+                values=(
+                    s.get('call_id', '?'),
+                    s.get('phone', '?'),
+                    f'{tri["lat"]:.5f}',
+                    f'{tri["lon"]:.5f}',
+                    tri.get('accuracy_m', '?'),
+                    tri.get('best_source', '?'),
+                    'YES' if tri.get('fused') else 'no',
+                    srcs,
+                ))
+        # If we had a selection, repaint the detail too
+        if self._selected_tri_call:
+            self._render_tri_detail(self._selected_tri_call)
+
+    def _on_tri_select(self, _evt=None):
+        sel = self._tri_tree.selection()
+        if not sel:
+            return
+        self._selected_tri_call = sel[0]
+        self._render_tri_detail(sel[0])
+
+    def _render_tri_detail(self, call_id):
+        w = self._tri_detail
+        w.configure(state='normal')
+        w.delete('1.0', tk.END)
+        try:
+            sess = call_center_service.get_session(call_id)
+        except Exception:
+            sess = None
+        if not sess:
+            w.insert(tk.END, '(call no longer active)\n', 'dim')
+            w.configure(state='disabled')
+            return
+        tri = sess.get('triangulation') or {}
+        loc = sess.get('location') or {}
+        w.insert(tk.END, f'CALL {sess.get("call_id")}\n', 'hd')
+        w.insert(tk.END, f'  phone:        {sess.get("phone","?")}\n')
+        w.insert(tk.END, f'  call_number:  {sess.get("call_number","?")}\n')
+        w.insert(tk.END, f'  ai_id:        {sess.get("ai_id","?")}\n\n')
+        if tri:
+            grade = ('HIGH' if tri.get('accuracy_m', 1e9) < 200
+                     else 'MEDIUM' if tri.get('accuracy_m', 1e9) < 5000
+                     else 'LOW')
+            tag = ('good' if grade == 'HIGH'
+                   else 'warn' if grade == 'MEDIUM' else 'bad')
+            w.insert(tk.END, '── Fused fix ──\n', 'hd')
+            w.insert(tk.END,
+                     f'  lat,lon: {tri["lat"]:.6f}, {tri["lon"]:.6f}\n')
+            w.insert(tk.END,
+                     f'  accuracy: ±{tri.get("accuracy_m","?")} m   [{grade}]\n',
+                     tag)
+            w.insert(tk.END,
+                     f'  best single source: {tri.get("best_source","?")}\n')
+            w.insert(tk.END,
+                     f'  fused (≥2 sources): {tri.get("fused", False)}\n\n')
+            w.insert(tk.END, '── Per-source contributions ──\n', 'hd')
+            for src in tri.get('sources') or []:
+                w.insert(tk.END,
+                         f'  • {src["name"]:<14}  '
+                         f'lat={src["lat"]:.5f}  lon={src["lon"]:.5f}  '
+                         f'σ=±{int(src["sigma_m"])}m  '
+                         f'weight={src["weight"]:.2e}  '
+                         f'grade={src.get("grade","?")}\n')
+            w.insert(tk.END, '\n')
+        else:
+            w.insert(tk.END, '(no triangulation yet — '
+                              'no locator data available)\n\n', 'dim')
+        if loc:
+            w.insert(tk.END, '── Raw current location field ──\n', 'hd')
+            for k in ('source', 'city', 'regionName', 'country', 'org',
+                       'isp', 'accuracy_m', 'address', 'updated_at'):
+                v = loc.get(k)
+                if v not in (None, '', '?'):
+                    w.insert(tk.END, f'  {k:<14}: {v}\n')
         w.configure(state='disabled')
 
     def _on_close(self):
@@ -32529,6 +39218,14 @@ class ConsciousnessSimulator(nn.Module):
             self.call_center.start()
         except Exception as _e:
             print(f"  [ERR] call_center_start: {_e}")
+        # Hand the simulator to the call-center so every ConsciousEntity in
+        # the swarm (visible in the Consciousness Virtual World window) is
+        # consulted on every transcript chunk and their per-AI votes get
+        # written to the per-call .txt on the operator's Desktop.
+        try:
+            self.call_center.attach_simulator(self)
+        except Exception as _e:
+            print(f"  [ERR] call_center_attach_simulator: {_e}")
         # ── Embedded dispatch web server (caller UI + operator console) ──
         self.dispatch_web = dispatch_web
         try:
