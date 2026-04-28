@@ -6193,7 +6193,7 @@ class CasualChatGenerator:
         than vocabulary — these chunks have plausible English words but
         no proper subject-verb-object structure. Heuristics:
 
-          (a) ≥3 stop-word/pronoun runs (≥2 consecutive function words)
+          (a) ≥4 stop-word/pronoun runs (≥2 consecutive function words)
               like "in the", "of the", "and the I" — STT mishearings are
               full of these because the engine fills gaps with common words
           (b) digit-tokens mixed into prose (numbers in a non-math chunk)
@@ -6202,9 +6202,12 @@ class CasualChatGenerator:
               real verb between them: "I want X and I think Y" is fine,
               but "I a bit of the flow and how was I want" is garbled)
           (d) low ratio of recognizable English (<35%)
-          (e) average word length under 3.5 (lots of short filler)
+          (e) average word length under 3.0 (lots of short filler)
 
-        Trips on ≥2 signals.
+        Trips on ≥3 signals. Coherent natural English with conditionals
+        and conjunctions ("if my phone is broken and the best option…")
+        will hit (a) and (e) on older thresholds but is not garbled, so
+        we require a third independent signal before firing.
         """
         if not text:
             return False
@@ -6242,7 +6245,7 @@ class CasualChatGenerator:
                     runs += 1
             else:
                 run_len = 0
-        many_runs = runs >= 3
+        many_runs = runs >= 4
         # (b) numbers in non-math prose
         digit_tokens = re.findall(r'\b\d[\d,\.]*\b', s)
         any_numbers = len(digit_tokens) >= 1
@@ -6265,8 +6268,11 @@ class CasualChatGenerator:
         low_recog = recog_ratio < 0.35
         # (e) short average word length
         avg_len = sum(len(w) for w in words) / max(1, len(words))
-        short_words = avg_len < 3.5
-        # Combine: any TWO triggers
+        short_words = avg_len < 3.0
+        # Combine: require THREE triggers — two are easy to hit on
+        # ordinary speech (a long conditional sentence trips runs +
+        # short_words), so we demand at least one more distinctive
+        # signal (rogue digits, repeated bare "I", or low recog).
         triggers = sum([
             many_runs,
             any_numbers and len(words) >= 8,
@@ -6274,7 +6280,7 @@ class CasualChatGenerator:
             low_recog,
             short_words,
         ])
-        return triggers >= 2
+        return triggers >= 3
 
     @classmethod
     def _classify_chunk(cls, chunk, ctx):
