@@ -1,105 +1,98 @@
 # =============================================================================
 # AUTO-INSTALL DEPENDENCIES
 # =============================================================================
-import os as _os
-_os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
-_os.environ.setdefault('OMP_NUM_THREADS', '4')
-del _os
+import os
+import sys
+import subprocess
 
-import subprocess as _sp
-import sys as _sys
+os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
+os.environ.setdefault('OMP_NUM_THREADS', '4')
+
+# Skip the auto-install probe entirely if the user opts out, or if we already
+# ran successfully in this interpreter (avoids redundant work on re-imports).
+_DEPS_OPT_OUT = os.environ.get('AIED_SKIP_AUTOINSTALL', '').lower() in ('1', 'true', 'yes')
+
+# Modules required for *core* functionality. Optional modules with graceful
+# fallbacks live in the HAS_* try/except section below — they should not be
+# pip-installed silently at import time. This is faster and safer.
+_REQUIRED_CORE = {
+    'torch': 'torch',
+    'numpy': 'numpy',
+    'PIL': 'pillow',
+    'requests': 'requests',
+    'networkx': 'networkx',
+    'sympy': 'sympy',
+    'bs4': 'beautifulsoup4',
+    'psutil': 'psutil',
+}
 
 def _auto_install():
-    """Auto-install all required packages. Skips already-installed ones."""
-    _required = {
-        'torch': 'torch',
-        'numpy': 'numpy',
-        'PIL': 'pillow',
-        'requests': 'requests',
-        'networkx': 'networkx',
-        'sympy': 'sympy',
-        'bs4': 'beautifulsoup4',
-        'pygame': 'pygame',
-        'matplotlib': 'matplotlib',
-        'psutil': 'psutil',
-        'pytesseract': 'pytesseract',
-        'fitz': 'pymupdf',
-        'pyttsx3': 'pyttsx3',
-        'tokenizers': 'tokenizers',
-        # ── Voice pipeline deps for the Tk Caller Phone window ──
-        # (best-effort; if pip can't install on this system the voice
-        #  mode toggle is disabled gracefully — typed flow still works.)
-        'sounddevice': 'sounddevice',
-        'speech_recognition': 'SpeechRecognition',
-        # ── Real OpenStreetMap tiles inside the Tk Caller Map tab ──
-        # Without this, the Tk map falls back to an abstract canvas grid.
-        'tkintermapview': 'tkintermapview',
-    }
-    _missing = []
-    for mod, pkg in _required.items():
+    """Install missing *core* deps. No-ops if everything is already present."""
+    if _DEPS_OPT_OUT:
+        return
+    missing = []
+    for mod, pkg in _REQUIRED_CORE.items():
         try:
             __import__(mod)
         except ImportError:
-            _missing.append(pkg)
-    if _missing:
-        print(f"Installing missing packages: {', '.join(_missing)}")
-        # Install one-at-a-time so an unavailable optional package (e.g.
-        # sounddevice on a system without PortAudio dev headers) doesn't
-        # block the rest. Failures are logged, not raised.
-        _ok, _failed = [], []
-        for _pkg in _missing:
-            try:
-                _sp.check_call(
-                    [_sys.executable, '-m', 'pip', 'install', '--quiet', _pkg])
-                _ok.append(_pkg)
-            except Exception as _e:
-                _failed.append(_pkg)
-        if _ok:
-            print(f"Installed: {', '.join(_ok)}")
-        if _failed:
-            print(f"WARNING: could not install: {', '.join(_failed)} "
-                  f"(features depending on these will be disabled)")
-    else:
-        print("All dependencies already installed.")
+            missing.append(pkg)
+    if not missing:
+        return  # silent — only log when we actually do work
+    print(f"Installing missing core packages: {', '.join(missing)}")
+    ok, failed = [], []
+    for pkg in missing:
+        try:
+            subprocess.check_call(
+                [sys.executable, '-m', 'pip', 'install', '--quiet', pkg])
+            ok.append(pkg)
+        except Exception:
+            failed.append(pkg)
+    if ok:
+        print(f"Installed: {', '.join(ok)}")
+    if failed:
+        print(f"WARNING: could not install: {', '.join(failed)} "
+              f"(features depending on these will be disabled)")
 
 _auto_install()
 
 def _write_launcher_bat():
-    """Auto-generate launch.bat next to CS.py for double-click launching."""
-    import os as _os
-    _bat_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'launch.bat')
-    _bat_content = r"""@echo off
-title Consciousness Simulator - Launcher
-echo ============================================================
-echo   Consciousness Simulator - Auto Setup ^& Launch
-echo ============================================================
-echo.
-echo Checking and installing required packages...
-echo.
-pip install torch torchvision torchaudio --quiet 2>nul
-pip install numpy pillow requests networkx sympy beautifulsoup4 --quiet 2>nul
-pip install pygame matplotlib psutil pytesseract pymupdf pyttsx3 tokenizers --quiet 2>nul
-echo.
-echo All dependencies checked. Launching Consciousness Simulator...
-echo ============================================================
-echo.
-python "%~dp0CS.py"
-if %errorlevel% neq 0 (
-    echo.
-    echo ERROR: CS.py exited with error code %errorlevel%
-    echo If Python was not found, install from python.org and add to PATH.
-)
-echo.
-pause
-"""
+    """Generate launch.bat next to this script — only if missing or stale.
+
+    Why "only if stale": this used to run on every import, rewriting the same
+    bytes hundreds of times. We now write once, then skip on subsequent runs
+    unless the file is missing or its content differs.
+    """
+    bat_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'launch.bat')
+    script_name = os.path.basename(os.path.abspath(__file__))
+    bat_content = (
+        '@echo off\r\n'
+        'title AIED - Launcher\r\n'
+        'echo ============================================================\r\n'
+        f'echo   AIED ({script_name}) - Launcher\r\n'
+        'echo ============================================================\r\n'
+        'echo.\r\n'
+        f'python "%~dp0{script_name}"\r\n'
+        'if %errorlevel% neq 0 (\r\n'
+        '    echo.\r\n'
+        f'    echo ERROR: {script_name} exited with error code %errorlevel%\r\n'
+        '    echo If Python was not found, install from python.org and add to PATH.\r\n'
+        ')\r\n'
+        'echo.\r\n'
+        'pause\r\n'
+    )
     try:
-        with open(_bat_path, 'w') as _f:
-            _f.write(_bat_content)
-    except Exception:
+        existing = None
+        if os.path.exists(bat_path):
+            with open(bat_path, 'r', encoding='utf-8', errors='replace') as f:
+                existing = f.read()
+        if existing != bat_content:
+            with open(bat_path, 'w', encoding='utf-8') as f:
+                f.write(bat_content)
+    except OSError:
         pass  # non-critical
 
 _write_launcher_bat()
-del _auto_install, _write_launcher_bat, _sp, _sys  # clean up namespace
+del _auto_install, _write_launcher_bat  # clean up namespace
 
 # =============================================================================
 # IMPORTS
@@ -134,9 +127,7 @@ import networkx as nx
 import sympy as sp  # For symbolic logic in neurons
 import torch.nn.utils.prune as prune  # For path refinement
 import ctypes  # For OS keyboard and mouse simulation
-import os
-import sys
-import subprocess
+# os, sys, subprocess imported in the AUTO-INSTALL prelude above
 import multiprocessing
 import mmap
 import socket
@@ -151,25 +142,32 @@ HAS_MEMORY_SYSTEM = True
 HAS_SELF_MODEL = True
 
 # --- Optional dependencies with graceful fallbacks ---
+# Warnings go to stderr (not stdout — keeps piped output clean) and can be
+# silenced entirely with AIED_QUIET_WARNINGS=1.
+_QUIET_OPT_WARN = os.environ.get('AIED_QUIET_WARNINGS', '').lower() in ('1', 'true', 'yes')
+def _opt_warn(msg):
+    if not _QUIET_OPT_WARN:
+        print(f"WARNING: {msg}", file=sys.stderr)
+
 try:
     import pygame
     HAS_PYGAME = True
 except ImportError:
-    print("WARNING: pygame not installed. Virtual world visualization disabled. pip install pygame")
+    _opt_warn("pygame not installed. Virtual world visualization disabled. pip install pygame")
     HAS_PYGAME = False
 
 try:
     import pytesseract
     HAS_TESSERACT = True
 except ImportError:
-    print("WARNING: pytesseract not installed. OCR disabled. pip install pytesseract")
+    _opt_warn("pytesseract not installed. OCR disabled. pip install pytesseract")
     HAS_TESSERACT = False
 
 try:
     import fitz  # PyMuPDF
     HAS_FITZ = True
 except ImportError:
-    print("WARNING: PyMuPDF not installed. PDF text extraction disabled. pip install pymupdf")
+    _opt_warn("PyMuPDF not installed. PDF text extraction disabled. pip install pymupdf")
     HAS_FITZ = False
 
 try:
@@ -177,22 +175,90 @@ try:
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
     HAS_MATPLOTLIB = True
 except ImportError:
-    print("WARNING: matplotlib not installed. Training charts disabled. pip install matplotlib")
+    _opt_warn("matplotlib not installed. Training charts disabled. pip install matplotlib")
     HAS_MATPLOTLIB = False
 
 try:
     import pyttsx3
     HAS_TTS = True
 except ImportError:
-    print("WARNING: pyttsx3 not installed. Text-to-speech disabled. pip install pyttsx3")
+    _opt_warn("pyttsx3 not installed. Text-to-speech disabled. pip install pyttsx3")
     HAS_TTS = False
 
 try:
     from tokenizers import Tokenizer, models, pre_tokenizers, trainers, decoders
     HAS_TOKENIZERS = True
 except ImportError:
-    print("WARNING: tokenizers not installed. Falling back to hash-based tokenizer. pip install tokenizers")
+    _opt_warn("tokenizers not installed. Falling back to hash-based tokenizer. pip install tokenizers")
     HAS_TOKENIZERS = False
+
+# ── Optional add-on modules: each gracefully no-ops if its deps aren't
+# installed. See cc_*.py modules at repo root for setup instructions.
+try:
+    import cc_llm_fallback
+    HAS_LLM_FALLBACK = True
+except Exception as _e:
+    _opt_warn(f"cc_llm_fallback unavailable: {_e}")
+    cc_llm_fallback = None
+    HAS_LLM_FALLBACK = False
+
+try:
+    import cc_persistent_memory
+    HAS_PERSISTENT_MEMORY = True
+except Exception as _e:
+    _opt_warn(f"cc_persistent_memory unavailable: {_e}")
+    cc_persistent_memory = None
+    HAS_PERSISTENT_MEMORY = False
+
+try:
+    import cc_whisper_stt
+    HAS_WHISPER_STT = True
+except Exception as _e:
+    _opt_warn(f"cc_whisper_stt unavailable: {_e}")
+    cc_whisper_stt = None
+    HAS_WHISPER_STT = False
+
+try:
+    import cc_geoip_real
+    HAS_GEOIP_REAL = True
+except Exception as _e:
+    _opt_warn(f"cc_geoip_real unavailable: {_e}")
+    cc_geoip_real = None
+    HAS_GEOIP_REAL = False
+
+try:
+    import cc_webrtc_server
+    HAS_WEBRTC = True
+except Exception as _e:
+    _opt_warn(f"cc_webrtc_server unavailable: {_e}")
+    cc_webrtc_server = None
+    HAS_WEBRTC = False
+
+# =============================================================================
+# AIED ERROR LOGGING SHIM
+# =============================================================================
+# 112+ error-print calls (originally bare prints with the prefix
+# "  [ERR] ") live across consciousness modules and per-cycle hot
+# loops. They flood the console at warning frequency when anything
+# is broken. This helper:
+#   - routes them to a real logger (named "aied", level=ERROR by default)
+#   - falls back to print() if logging isn't configured
+#   - is silenceable via AIED_QUIET_ERRORS=1
+import logging as _aied_logging
+_aied_logger = _aied_logging.getLogger('aied')
+_AIED_QUIET_ERRORS = os.environ.get('AIED_QUIET_ERRORS', '').lower() in ('1', 'true', 'yes')
+
+def _aied_err(msg):
+    if _AIED_QUIET_ERRORS:
+        return
+    if _aied_logger.handlers or _aied_logging.getLogger().handlers:
+        _aied_logger.error(msg)
+    else:
+        # Logger not configured — preserve original behavior so messages
+        # don't vanish in scripts that never call logging.basicConfig().
+        # NOTE: must use sys.stdout.write/print directly here — calling
+        # _aied_err recursively would infinite-loop.
+        print(f"  [ERR] {msg}")
 
 # =============================================================================
 # PYGAME VIRTUAL WORLD (inlined — runs as a separate process via multiprocessing)
@@ -819,7 +885,13 @@ _CC_DEFAULT_ARCHIVE = {
 }
 
 class _CCArchive:
-    """Routing archive with persistence and adaptive priority."""
+    """Routing archive with persistence and adaptive priority.
+
+    THREAD SAFETY: lookup() and record_outcome() are invoked from multiple
+    request-handler threads. defaultdict[key] += 1 is not atomic across
+    multi-step operations on PyPy/free-threaded CPython, and concurrent
+    save() vs mutation could race the JSON write. A single RLock protects
+    all four mutable mappings."""
 
     def __init__(self):
         self.entries = dict(_CC_DEFAULT_ARCHIVE)
@@ -827,6 +899,7 @@ class _CCArchive:
         self.hits = defaultdict(int)
         self.confirms = defaultdict(int)     # operator confirmed correct
         self.overrides = defaultdict(int)    # operator overrode the action
+        self._lock = threading.RLock()
         self._load_learned()
 
     def _load_learned(self):
@@ -850,55 +923,69 @@ class _CCArchive:
             _cc_logger.error(f'archive load failed: {e}')
 
     def save(self):
-        try:
-            payload = {
-                'entries': {json.dumps(list(k)): list(v) for k, v in self.entries.items()},
-                'hits':    {json.dumps(list(k)): int(n) for k, n in self.hits.items()},
-            }
-            with open(_CC_LEARNED_PATH, 'w', encoding='utf-8') as f:
-                json.dump(payload, f, indent=2)
-        except Exception as e:
-            _cc_logger.error(f'archive save failed: {e}')
+        with self._lock:
+            try:
+                payload = {
+                    'entries': {json.dumps(list(k)): list(v) for k, v in self.entries.items()},
+                    'hits':    {json.dumps(list(k)): int(n) for k, n in self.hits.items()},
+                }
+                # Atomic write: write-then-rename, so a crash mid-write
+                # leaves the prior valid file intact instead of an empty one.
+                tmp_path = _CC_LEARNED_PATH + '.tmp'
+                with open(tmp_path, 'w', encoding='utf-8') as f:
+                    json.dump(payload, f, indent=2)
+                os.replace(tmp_path, _CC_LEARNED_PATH)
+            except Exception as e:
+                _cc_logger.error(f'archive save failed: {e}')
 
     def lookup(self, intent, urgency, psych, coherence):
         """Exact → coherence-bucket → similarity fallback. Returns (action_tuple, key_used, fallback_reason)."""
-        # 1. exact
-        exact_key = (intent, urgency, psych, coherence)
-        if exact_key in self.entries:
-            self.hits[exact_key] += 1
-            return self.entries[exact_key], exact_key, 'exact'
-        # 2. coherence-agnostic (key uses 0 as wildcard)
-        wild_key = (intent, urgency, psych, 0)
-        if wild_key in self.entries:
-            self.hits[wild_key] += 1
-            return self.entries[wild_key], wild_key, 'coherence_wildcard'
-        # 3. intent + psych match, highest urgency
-        candidates = [k for k in self.entries if k[0] == intent and k[2] == psych]
-        if candidates:
-            k = max(candidates, key=lambda x: x[1])
-            self.hits[k] += 1
-            return self.entries[k], k, 'intent+psych'
-        # 4. intent only
-        candidates = [k for k in self.entries if k[0] == intent]
-        if candidates:
-            k = max(candidates, key=lambda x: x[1])
-            self.hits[k] += 1
-            return self.entries[k], k, 'intent_only'
-        # 5. last-resort default
-        return ('ANSWER_DIRECTLY', 40, "I'm here to help. What's going on?", 'NONE'), None, 'default'
+        with self._lock:
+            # 1. exact
+            exact_key = (intent, urgency, psych, coherence)
+            if exact_key in self.entries:
+                self.hits[exact_key] += 1
+                return self.entries[exact_key], exact_key, 'exact'
+            # 2. coherence-agnostic (key uses 0 as wildcard)
+            wild_key = (intent, urgency, psych, 0)
+            if wild_key in self.entries:
+                self.hits[wild_key] += 1
+                return self.entries[wild_key], wild_key, 'coherence_wildcard'
+            # 3. intent + psych match, highest urgency
+            candidates = [k for k in self.entries if k[0] == intent and k[2] == psych]
+            if candidates:
+                k = max(candidates, key=lambda x: x[1])
+                self.hits[k] += 1
+                return self.entries[k], k, 'intent+psych'
+            # 4. intent only
+            candidates = [k for k in self.entries if k[0] == intent]
+            if candidates:
+                k = max(candidates, key=lambda x: x[1])
+                self.hits[k] += 1
+                return self.entries[k], k, 'intent_only'
+            # 5. last-resort default
+            return ('ANSWER_DIRECTLY', 40, "I'm here to help. What's going on?", 'NONE'), None, 'default'
 
     def record_outcome(self, key, confirmed):
         if key is None:
             return
-        if confirmed:
-            self.confirms[key] += 1
-        else:
-            self.overrides[key] += 1
+        with self._lock:
+            if confirmed:
+                self.confirms[key] += 1
+            else:
+                self.overrides[key] += 1
 
 _cc_archive = _CCArchive()
 
 # ── Call number generator (ported from Main_monolith) ──
+# Keyspace = 900 * 900 * 9000 ≈ 7.3e9, so collision probability stays tiny
+# even with hundreds of thousands of calls. We cap recent-history size to
+# bound memory in long-running processes; older entries fall out of the
+# uniqueness check (acceptable — the call number is a display reference,
+# not a primary key).
+_CC_USED_NUMBERS_MAX = 200_000
 _cc_used_call_numbers = set()
+_cc_used_call_numbers_order = deque()
 _cc_call_number_lock = threading.Lock()
 
 def _cc_generate_call_number():
@@ -911,6 +998,10 @@ def _cc_generate_call_number():
             cn = f'{part1}-{part2}-{part3}'
             if cn not in _cc_used_call_numbers:
                 _cc_used_call_numbers.add(cn)
+                _cc_used_call_numbers_order.append(cn)
+                if len(_cc_used_call_numbers_order) > _CC_USED_NUMBERS_MAX:
+                    old = _cc_used_call_numbers_order.popleft()
+                    _cc_used_call_numbers.discard(old)
                 return cn
 
 
@@ -1588,6 +1679,13 @@ _NPA_RATE_CENTERS = {
 
 _PHONE_DIGITS_RE = _cc_re.compile(r'\D+')
 
+# Reported geolocation accuracy (meters) when the source is *not* device-GPS:
+#   - phone NPA → rate-center city centroid: ~city/region precision
+#   - IP-API geolocation: ~city precision
+# Used as the `accuracy_m` field on session.location dicts so the UI can
+# choose to ignore positions less precise than a given threshold.
+_GEO_ACCURACY_COARSE_M = 50000  # ±50 km
+
 
 def _phone_extract_npa(phone):
     """Strip phone number to digits, drop leading '1' country code,
@@ -1635,7 +1733,7 @@ def phone_to_location(phone):
                                                 'NT', 'YT', 'NU')
                               else 'US'),
         'lat': float(lat), 'lon': float(lon),
-        'accuracy_m': 50000,    # rate-center precision: ~50km worst case
+        'accuracy_m': _GEO_ACCURACY_COARSE_M,  # rate-center precision: ~50km worst case
         'source': 'phone-rate-center',
         'npa': npa,
         'updated_at': datetime.now().strftime('%H:%M:%S.%f')[:-3],
@@ -5767,52 +5865,86 @@ class CasualChatGenerator:
         "Hi. Glad you called. Just a casual line — anything you want to talk about?",
         "Hello. I'm here. What's on your mind?",
         "Hey, welcome. I'm not in any rush — what brought you in?",
+        "Hi there. The line's quiet — pull up a thought and we'll go.",
+        "Hey. No agenda on my end. Where would you like to start?",
+        "Good to hear from you. What's the shape of your day so far?",
+        "Hello. I'm settled in. What did you want to chew on?",
     )
     _RESP_AFFIRM = (
         "Good. I'm with you on that.",
         "Yeah, makes sense to me.",
         "Right, I figured.",
         "Okay, fair enough.",
+        "Yeah, that tracks.",
+        "Mm. I follow you.",
+        "Sure — I see what you're getting at.",
+        "Right, that lines up.",
     )
     _RESP_NEGATIVE = (
         "Got it — let's drop that one.",
         "Okay, no worries. We'll leave it alone.",
         "Fair. I'll back off that.",
         "Heard. Let's move on.",
+        "Alright, scratch it. What's better to land on?",
+        "Noted — I'll set that aside.",
+        "Okay, point taken. Pick the next thread.",
+        "Got it, off the table. Where to instead?",
     )
     _RESP_FRUSTRATION = (
         "I hear you — I'll slow down.",
         "Sorry, that came out wrong. Let me start fresh.",
         "Yeah, that's on me. What do you actually want to talk about?",
         "Okay, my bad. Set the topic and I'll follow.",
+        "Got it — I was off. Steer me where you want to go.",
+        "Fair, I overshot. Want to back up a step?",
+        "Sorry — let me drop the pace. What's the actual concern?",
+        "On me. Take the wheel — what should we be talking about?",
     )
     _RESP_CORRECTION = (
         "Ah, my mistake — what was the right word?",
         "Got it, I misheard. Want to repeat that for me?",
         "Sorry, voice-to-text is rough on my end. What did you actually say?",
         "Mishearing on my side, sorry. Try me again?",
+        "My ear missed that. One more time, a touch slower?",
+        "Heard wrong — apologies. What's the actual phrase?",
+        "Caught the wrong word, sorry. Replay that for me?",
+        "On me. Could you say the key word again?",
     )
     _RESP_QUESTION = (
         "Honestly, I'm not sure — what makes you ask?",
         "Hard one. I'd lean either way depending on the day.",
         "Mm — I'd say it depends. What are you really after?",
         "I think about that one too. Tell me how you'd answer it.",
+        "Good question. Where's it coming from for you?",
+        "Genuine answer? I don't have a settled view. What's pulling you to it?",
+        "I'd want to hear your take first — yours probably matters more here.",
+        "It's the kind of thing that flips depending on the framing. What's yours?",
     )
     _RESP_FAREWELL = (
         "Okay — take care of yourself. I'll stay on the line if you want.",
         "Alright. I'm here whenever, no rush to hang up.",
         "Sure thing. I'll just sit with you a minute.",
+        "Take it easy. The line stays open as long as you need.",
+        "Alright — I'm not going anywhere. Hop off whenever.",
+        "Take care. If you circle back later, I'll be here.",
     )
     _RESP_THANKS = (
         "Of course. Glad to.",
         "Anytime. That's what I'm here for.",
         "No problem. Stick around as long as you want.",
+        "Sure — easy.",
+        "Yeah, no need for thanks. Happy to.",
+        "Of course. The line's yours.",
     )
     _RESP_SHORT_FILLER = (
         "Mm-hm. Anything more on your mind?",
         "Okay. What else?",
         "Right. Want to keep going on that?",
         "Got it. What's next?",
+        "Hm. Where do you want to take it?",
+        "Alright. Anything pulling at you?",
+        "Yeah. Want to dig in or change tack?",
+        "Mm. What sits next to that for you?",
     )
 
     # Comparative / preference vocabulary (caller is comparing two things)
@@ -6100,6 +6232,15 @@ class CasualChatGenerator:
         ('mod',           '%'),
     )
 
+    # Pre-compiled regexes — _try_math_eval is called per STT chunk in voice
+    # sessions, so even cached re.search() module lookups add up.
+    _RE_HAS_DIGIT      = re.compile(r'\d')
+    _RE_TRAIL_PUNCT    = re.compile(r'[?!.]+$')
+    _RE_X_TIMES        = re.compile(r'(\d)\s*[xX×]\s*(\d)')
+    _RE_NUM_COMMA      = re.compile(r'(\d),(\d{3}\b)')
+    _RE_MATH_ONLY      = re.compile(r'[\d\s\.\+\-\*\/\%\^\(\)]+')
+    _RE_HAS_OP         = re.compile(r'[\+\-\*\/\%]')
+
     @classmethod
     def _try_math_eval(cls, text):
         """Try to extract and evaluate an arithmetic expression from the
@@ -6110,7 +6251,7 @@ class CasualChatGenerator:
             return None
         s = text.strip().lower()
         # Must contain at least one digit. Most chunks won't.
-        if not re.search(r'\d', s):
+        if not cls._RE_HAS_DIGIT.search(s):
             return None
         # Drop "what is", "what's", "calculate", "compute", "how much is"
         # so the expression starts clean. Both apostrophe-bearing and
@@ -6128,25 +6269,25 @@ class CasualChatGenerator:
                 s = s.split(prefix, 1)[1].strip()
                 break
         # Strip trailing punctuation
-        s = re.sub(r'[?!.]+$', '', s).strip()
+        s = cls._RE_TRAIL_PUNCT.sub('', s).strip()
         # Normalize word operators → symbolic
         for word, sym in cls._MATH_WORD_OPS:
             s = re.sub(r'\b' + re.escape(word) + r'\b', sym, s)
         # Common patterns: "15x3" → "15*3", "15X3" → "15*3"
-        s = re.sub(r'(\d)\s*[xX×]\s*(\d)', r'\1*\2', s)
+        s = cls._RE_X_TIMES.sub(r'\1*\2', s)
         # "5÷3" → "5/3"
         s = s.replace('÷', '/').replace('−', '-').replace('—', '-')
         # Drop commas inside numbers ("1,000" → "1000")
-        s = re.sub(r'(\d),(\d{3}\b)', r'\1\2', s)
+        s = cls._RE_NUM_COMMA.sub(r'\1\2', s)
         # Now require the cleaned text to be ONLY digits/ops/parens/spaces.
         # If anything else remains, abort — we don't want to "do math" on
         # noisy speech-to-text that happens to have a number in it.
-        if not re.fullmatch(r'[\d\s\.\+\-\*\/\%\^\(\)]+', s):
+        if not cls._RE_MATH_ONLY.fullmatch(s):
             return None
         # ^ is XOR in Python; replace with **
         s = s.replace('^', '**')
         # Need at least one operator AND at least one digit
-        if not re.search(r'[\+\-\*\/\%]', s) or not re.search(r'\d', s):
+        if not cls._RE_HAS_OP.search(s) or not cls._RE_HAS_DIGIT.search(s):
             return None
         # Length sanity
         if len(s) > 80:
@@ -6310,6 +6451,13 @@ class CasualChatGenerator:
         }
         if not chunk:
             return result
+        # Normalize informal variants ("ya"/"yup"/"u"/"idk"/"nah" etc.) to
+        # canonical forms BEFORE the regex classifier looks at them. This
+        # widens recall on paraphrases without bloating the patterns below.
+        try:
+            chunk = cls._normalize_synonyms(chunk)
+        except Exception:
+            pass
         text = chunk.strip().lower()
         if not text:
             return result
@@ -7634,6 +7782,9 @@ class CasualChatGenerator:
         if intent and intent not in ('open', 'idle', 'repeat_prior'):
             ctx['last_intent'] = intent
         ts = datetime.now().strftime('%H:%M:%S')
+        # Persistent memory: write to SQLite so the AI 'remembers' across
+        # call sessions. Best-effort — failure here never affects chat.
+        sid = ctx.get('session_id') or ctx.get('call_id') or 'default'
         # Track caller chunk (full call history)
         if chunk:
             ctx['caller_history'].append(chunk)
@@ -7647,6 +7798,14 @@ class CasualChatGenerator:
                 'topics': list(new_topics or []),
                 'ts':     ts,
             })
+            if HAS_PERSISTENT_MEMORY and cc_persistent_memory is not None:
+                try:
+                    cc_persistent_memory.record(
+                        sid, 'caller', chunk,
+                        meta={'intent': intent,
+                              'topics': list(new_topics or [])})
+                except Exception:
+                    pass
         # Track AI reply
         if reply:
             ctx['ai_history'].append(reply)
@@ -7660,6 +7819,12 @@ class CasualChatGenerator:
                 'topics': [],
                 'ts':     ts,
             })
+            if HAS_PERSISTENT_MEMORY and cc_persistent_memory is not None:
+                try:
+                    cc_persistent_memory.record(
+                        sid, 'ai', reply, meta={'intent': intent})
+                except Exception:
+                    pass
         # Cap turn_log too
         if len(ctx.get('turn_log') or []) > 1000:
             ctx['turn_log'] = ctx['turn_log'][-1000:]
@@ -7714,6 +7879,95 @@ class CasualChatGenerator:
             'last_ai':          last_ai,
             'opening_line':     opening,
         }
+
+    # ── Conversational synonym normalizer ────────────────────────────
+    # Maps common contractions and informal variants to canonical forms
+    # BEFORE classification, so the regex/keyword classifier in
+    # _classify_chunk catches more paraphrases. e.g. "ya" → "yeah",
+    # "u" → "you", "tbh" → "to be honest". Cheap and high-recall.
+    _SYNONYM_MAP = {
+        # affirmations
+        'ya': 'yeah', 'yah': 'yeah', 'yup': 'yes', 'yea': 'yeah',
+        'mhm': 'yeah', 'mmhm': 'yeah', 'mm-hm': 'yeah', 'uh huh': 'yeah',
+        'uh-huh': 'yeah', 'k': 'okay', 'kk': 'okay', 'ok': 'okay',
+        # negations
+        'nah': 'no', 'nope': 'no', 'nuh uh': 'no', 'nuh-uh': 'no',
+        'naw': 'no',
+        # texting shorthand
+        'u': 'you', 'ur': 'your', 'r': 'are', 'idk': "i don't know",
+        'tbh': 'to be honest', 'imo': 'in my opinion',
+        'lmk': 'let me know', 'btw': 'by the way',
+        'cuz': 'because', 'cause': 'because', 'coz': 'because',
+        # presence-ish
+        'hellooo': 'hello', 'helloo': 'hello', 'heyy': 'hey',
+        'hellooooo': 'hello',
+    }
+
+    @classmethod
+    def _normalize_synonyms(cls, text):
+        """Map common informal variants to canonical forms before
+        classification. Word-boundary safe — won't munge 'okay' inside
+        a longer word."""
+        if not text:
+            return text
+        out = text
+        # Apply per-token replacement on lowercased copy, preserve original
+        # punctuation as much as we can.
+        words = re.findall(r"[\w']+|[^\w\s]", out)
+        for i, w in enumerate(words):
+            lw = w.lower()
+            if lw in cls._SYNONYM_MAP:
+                words[i] = cls._SYNONYM_MAP[lw]
+        # Re-join: tokens of word chars get spaces between them, punctuation
+        # sticks to the previous token.
+        rebuilt = []
+        for w in words:
+            if rebuilt and re.match(r"[\w']+", w) and re.match(r"[\w']+", rebuilt[-1]):
+                rebuilt.append(' ')
+            rebuilt.append(w)
+        return ''.join(rebuilt)
+
+    @classmethod
+    def _reply_similarity(cls, a, b):
+        """Cheap Jaccard similarity over lowercased word sets, ignoring
+        stop words. Returns 0.0 (different) — 1.0 (identical). Used to
+        avoid repeating the same canned reply twice in a row."""
+        if not a or not b:
+            return 0.0
+        wa = {w for w in re.findall(r"[a-z]{3,}", a.lower())
+              if w not in cls._STOP_WORDS}
+        wb = {w for w in re.findall(r"[a-z]{3,}", b.lower())
+              if w not in cls._STOP_WORDS}
+        if not wa or not wb:
+            return 0.0
+        inter = len(wa & wb)
+        union = len(wa | wb)
+        return inter / union if union else 0.0
+
+    @classmethod
+    def _pick_unrepeated(cls, options, last_ai, rng, threshold=0.55):
+        """Pick from options preferring ones that don't overlap heavily
+        with recent AI replies. Falls back to a random pick if every
+        option is too similar (better to mildly repeat than to crash)."""
+        if not options:
+            return ''
+        opts = list(options)
+        rng.shuffle(opts)
+        last = list(last_ai or [])[-3:]
+        for cand in opts:
+            if not last:
+                return cand
+            max_sim = max(
+                (cls._reply_similarity(cand, prev) for prev in last),
+                default=0.0)
+            if max_sim < threshold:
+                return cand
+        # Everything overlaps — return whichever has the lowest max-sim.
+        return min(
+            opts,
+            key=lambda c: max(
+                (cls._reply_similarity(c, p) for p in last),
+                default=0.0))
 
     @classmethod
     def _normalize(cls, text):
@@ -9121,7 +9375,7 @@ class CallCenterService:
                         'org': info.get('org') or '',
                         'isp': info.get('isp') or '',
                         'timezone': info.get('timezone') or '',
-                        'accuracy_m': 50000,   # IP geolocation: ~city level
+                        'accuracy_m': _GEO_ACCURACY_COARSE_M,  # IP geolocation: ~city level
                         'source': (info.get('_source') or 'ip-api')
                                    + (':public_fallback'
                                       if used_source == 'operator_public_ip'
@@ -9299,7 +9553,7 @@ class CallCenterService:
                             'org': pub.get('org') or '',
                             'isp': pub.get('isp') or '',
                             'timezone': pub.get('timezone') or '',
-                            'accuracy_m': 50000,
+                            'accuracy_m': _GEO_ACCURACY_COARSE_M,
                             'source': 'operator_public_ip:bootstrap',
                             'updated_at': datetime.now().strftime('%H:%M:%S.%f')[:-3],
                         }
@@ -9339,7 +9593,7 @@ class CallCenterService:
                                     'org': pub.get('org') or '',
                                     'isp': pub.get('isp') or '',
                                     'timezone': pub.get('timezone') or '',
-                                    'accuracy_m': 50000,
+                                    'accuracy_m': _GEO_ACCURACY_COARSE_M,
                                     'source': 'operator_public_ip:bootstrap',
                                     'updated_at': datetime.now().strftime(
                                         '%H:%M:%S.%f')[:-3],
@@ -11194,7 +11448,7 @@ class SystemWindowOps:
                     ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
             except Exception as e:
                 self.is_windows = False
-                print(f"  [ERR] SystemWindowOps init: {e}")
+                _aied_err(f"SystemWindowOps init: {e}")
 
     # ── Enumeration ────────────────────────────────────────────────
     def enumerate_top_level(self):
@@ -11233,7 +11487,7 @@ class SystemWindowOps:
         try:
             u.EnumWindows(ENUM_PROC(_cb), 0)
         except Exception as e:
-            print(f"  [ERR] EnumWindows: {e}")
+            _aied_err(f"EnumWindows: {e}")
         return results
 
     def _get_rect(self, hwnd):
@@ -11275,7 +11529,7 @@ class SystemWindowOps:
             self._user32.ShowWindow(hwnd, self.SW_RESTORE)
             return bool(self._user32.SetForegroundWindow(hwnd))
         except Exception as e:
-            print(f"  [ERR] focus: {e}")
+            _aied_err(f"focus: {e}")
             return False
 
     def minimize(self, hwnd):
@@ -11304,7 +11558,7 @@ class SystemWindowOps:
                 return None
             return ImageGrab.grab(bbox=(l, t, r, b))
         except Exception as e:
-            print(f"  [ERR] screenshot_window: {e}")
+            _aied_err(f"screenshot_window: {e}")
             return None
 
     def find_by_title(self, substring):
@@ -11974,6 +12228,168 @@ def _cc_render_call_page(sess):
     return _cc_render_base(f"Call {sess['call_number']}", '', body)
 
 
+def _cc_render_video_page(sess):
+    """Live video + audio call page using WebRTC.
+
+    The browser captures camera + mic via getUserMedia, opens an
+    RTCPeerConnection with a single SDP offer POSTed to /api/webrtc/offer,
+    receives the SDP answer, and streams real-time A/V to the dispatcher.
+
+    Server-side termination is handled by cc_webrtc_server (aiortc).
+    The operator console polls /api/webrtc/frame/<call_id>.jpg to
+    display the caller's video tile.
+    """
+    cid = sess['call_id']
+    cid_safe = _cc_urlparse.quote(cid, safe='')
+    cn  = sess.get('call_number', '')
+    body = f"""
+    <h1>📹 Video Call — {_cc_html.escape(cn)}</h1>
+    <div class="panel">
+      <div class="row">
+        <div><div class="dim small">DISPATCH AI</div><div style="font-size:1.4em">{_cc_html.escape(sess['ai_id'])}</div></div>
+        <div><div class="dim small">CALL #</div><div class="mono" style="font-size:1.4em">{_cc_html.escape(cn)}</div></div>
+        <div><div class="dim small">VIDEO</div><div id="vstat"><span class="pill dim">connecting...</span></div></div>
+        <div><div class="dim small">AUDIO</div><div id="astat"><span class="pill dim">connecting...</span></div></div>
+      </div>
+    </div>
+    <div class="panel" style="text-align:center">
+      <video id="local" autoplay muted playsinline
+             style="width:100%; max-width:640px; background:#000;
+                    border:2px solid #224488; border-radius:6px"></video>
+      <div class="dim small" style="margin-top:8px">
+        Your camera + mic stream live to the dispatcher. Tap Hang Up to end.
+      </div>
+      <div style="margin-top:12px; display:flex; gap:18px; justify-content:center; flex-wrap:wrap">
+        <label class="small dim"><input type="checkbox" id="cam" checked> Camera</label>
+        <label class="small dim"><input type="checkbox" id="micEn" checked> Microphone</label>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>Transcript</h3>
+      <div id="log" style="max-height:30vh; overflow-y:auto"></div>
+    </div>
+    <div class="row">
+      <button id="hangup" class="danger" style="padding:14px">Hang Up</button>
+      <a href="/voice/{cid_safe}"><button>Switch to voice only</button></a>
+    </div>
+    <script>
+      const callId = {json.dumps(cid)};
+      const localV = document.getElementById('local');
+      const vstat  = document.getElementById('vstat');
+      const astat  = document.getElementById('astat');
+      const logEl  = document.getElementById('log');
+      const camChk = document.getElementById('cam');
+      const micChk = document.getElementById('micEn');
+      let pc = null;
+      let stream = null;
+      let dataChannel = null;
+
+      function appendLog(role, text) {{
+        const div = document.createElement('div');
+        div.style.padding = '4px 0';
+        div.innerHTML = '<strong>'+role+':</strong> '+text;
+        logEl.appendChild(div);
+        logEl.scrollTop = logEl.scrollHeight;
+      }}
+
+      async function start() {{
+        try {{
+          stream = await navigator.mediaDevices.getUserMedia({{
+            video: {{ width: 640, height: 480, frameRate: 15 }},
+            audio: true
+          }});
+        }} catch (e) {{
+          vstat.innerHTML = '<span class="pill bad">camera/mic blocked</span>';
+          alert('Camera + microphone access required for video call.\\n\\n'+e);
+          return;
+        }}
+        localV.srcObject = stream;
+        const ICE = [
+          {{ urls: ['stun:stun.l.google.com:19302'] }},
+          {{ urls: ['stun:stun1.l.google.com:19302'] }}
+        ];
+        pc = new RTCPeerConnection({{ iceServers: ICE }});
+
+        pc.onconnectionstatechange = () => {{
+          const s = pc.connectionState;
+          if (s === 'connected') {{
+            vstat.innerHTML = '<span class="pill good">connected</span>';
+            astat.innerHTML = '<span class="pill good">connected</span>';
+          }} else if (s === 'failed' || s === 'disconnected' || s === 'closed') {{
+            vstat.innerHTML = '<span class="pill bad">'+s+'</span>';
+            astat.innerHTML = '<span class="pill bad">'+s+'</span>';
+          }} else {{
+            vstat.innerHTML = '<span class="pill dim">'+s+'</span>';
+          }}
+        }};
+
+        // Bidirectional text via data channel (so the AI can write replies)
+        dataChannel = pc.createDataChannel('chat');
+        dataChannel.onopen  = () => appendLog('system', 'data channel open');
+        dataChannel.onmessage = (e) => appendLog('ai', e.data);
+
+        // Add tracks
+        stream.getTracks().forEach(t => pc.addTrack(t, stream));
+
+        // ICE complete: gather then send offer
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        // Wait for ICE gathering complete (so the SDP carries candidates)
+        if (pc.iceGatheringState !== 'complete') {{
+          await new Promise(resolve => {{
+            const check = () => {{
+              if (pc.iceGatheringState === 'complete') resolve();
+              else setTimeout(check, 100);
+            }};
+            check();
+          }});
+        }}
+
+        const r = await fetch('/api/webrtc/offer', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{
+            call_id: callId,
+            sdp: pc.localDescription.sdp,
+            type: pc.localDescription.type
+          }})
+        }});
+        const ans = await r.json();
+        if (ans.error) {{
+          vstat.innerHTML = '<span class="pill bad">server: '+ans.error+'</span>';
+          appendLog('error', ans.error);
+          return;
+        }}
+        await pc.setRemoteDescription({{ sdp: ans.sdp, type: ans.type }});
+      }}
+
+      camChk.addEventListener('change', () => {{
+        if (!stream) return;
+        stream.getVideoTracks().forEach(t => t.enabled = camChk.checked);
+      }});
+      micChk.addEventListener('change', () => {{
+        if (!stream) return;
+        stream.getAudioTracks().forEach(t => t.enabled = micChk.checked);
+      }});
+      document.getElementById('hangup').addEventListener('click', async () => {{
+        try {{
+          await fetch('/api/webrtc/close', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ call_id: callId }})
+          }});
+        }} catch (e) {{}}
+        if (pc) pc.close();
+        if (stream) stream.getTracks().forEach(t => t.stop());
+        location.href = '/';
+      }});
+
+      start();
+    </script>
+    """
+    return _cc_render_base(f"Video Call {sess['call_number']}", '', body)
+
+
 def _cc_render_voice_page(sess):
     """Live voice-call page. Browser-native:
        - getUserMedia + MediaRecorder for audio capture
@@ -11983,6 +12399,7 @@ def _cc_render_voice_page(sess):
        - SSE stream subscribed to push the AI's response the moment it lands
     """
     cid = sess['call_id']
+    call_id_safe = _cc_urlparse.quote(cid, safe='')
     cn  = sess.get('call_number', '')
     body = f"""
     <h1>📞 Voice Call — {_cc_html.escape(cn)}</h1>
@@ -12050,6 +12467,7 @@ def _cc_render_voice_page(sess):
     </div>
     <div class="row">
       <button id="hangup" class="danger" style="padding:14px">Hang Up</button>
+      <a href="/video/{call_id_safe}"><button class="primary">📹 Switch to video call</button></a>
       <button id="textfallback">Switch to text only</button>
     </div>
     <script>
@@ -14358,6 +14776,15 @@ def _cc_render_console(token):
             <div><div class="dim small">Decisions</div><div>${{(s.decisions||[]).length}}</div></div>
           </div>
           <div style="margin-top:8px"><div class="dim small">📍 LOCATION</div><div>${{locStr}}${{mapsLink}}</div></div>
+          <details class="incident-section" data-key="video" open>
+            <summary>📹 Live Video <span id="vid-status" class="dim small">(no stream)</span></summary>
+            <div style="text-align:center; padding:6px 0">
+              <img id="vid-tile" alt="caller video" style="max-width:100%; max-height:360px; background:#000; border:2px solid #224488; border-radius:4px; display:none">
+              <div id="vid-empty" class="dim small" style="padding:20px">
+                Caller has not started a video call. Send them <a href="/video/${{encodeURIComponent(SELECTED)}}" target="_blank">/video/${{escHtml(SELECTED)}}</a>.
+              </div>
+            </div>
+          </details>
           <div class="row" style="margin-top:8px; flex-wrap:wrap">
             <button onclick="expandAllSections(true)" class="ghost">⊕ Expand all</button>
             <button onclick="expandAllSections(false)" class="ghost">⊖ Collapse all</button>
@@ -14414,6 +14841,50 @@ def _cc_render_console(token):
           }}
         }} catch (e) {{}}
       }}
+      // ── Live video poller ────────────────────────────────────────────
+      // Polls /api/webrtc/frame/<id>.jpg every 200ms while a call is
+      // selected. Hides itself if the endpoint returns 404 (no frame
+      // yet). Cheap enough at 5 FPS — a real product would swap to
+      // server-pushed MJPEG or its own WebRTC return path.
+      let _vidTimer = null;
+      function startVideoPoll() {{
+        if (_vidTimer) clearInterval(_vidTimer);
+        _vidTimer = setInterval(async () => {{
+          if (!SELECTED) return;
+          const tile  = document.getElementById('vid-tile');
+          const empty = document.getElementById('vid-empty');
+          const stat  = document.getElementById('vid-status');
+          if (!tile) return;
+          try {{
+            const r = await fetch('/api/webrtc/frame/'+encodeURIComponent(SELECTED)+'.jpg?token='+encodeURIComponent(TOK)+'&t='+Date.now(),
+                                  {{ cache: 'no-store' }});
+            if (r.status === 200) {{
+              const blob = await r.blob();
+              const url = URL.createObjectURL(blob);
+              const oldUrl = tile.src;
+              tile.onload = () => {{ if (oldUrl && oldUrl.startsWith('blob:')) URL.revokeObjectURL(oldUrl); }};
+              tile.src = url;
+              tile.style.display = '';
+              if (empty) empty.style.display = 'none';
+              if (stat) stat.textContent = '(LIVE)';
+            }} else {{
+              tile.style.display = 'none';
+              if (empty) empty.style.display = '';
+              if (stat) stat.textContent = '(no stream)';
+            }}
+          }} catch (e) {{
+            // network blip — leave the previous frame on screen
+          }}
+        }}, 200);
+      }}
+      // Kick once on first selection; renderDetail() rebuilds the DOM
+      // each time so we restart the poller after every render.
+      const _origRenderDetail = renderDetail;
+      renderDetail = function() {{
+        _origRenderDetail();
+        startVideoPoll();
+      }};
+
       async function markFalseAlarm() {{
         if (!SELECTED) return;
         if (!confirm('Mark this call as a false alarm and recall any dispatched units?')) return;
@@ -14695,6 +15166,89 @@ def _cc_render_console(token):
     return _cc_render_base('AIdispatch Console', head_extra, body)
 
 
+# ── Real-time STT bridge for active WebRTC calls ─────────────────────────
+# When a video call's SDP offer succeeds, we kick a daemon thread that:
+#   1. Drains 16kHz mono PCM from cc_webrtc_server every WEBRTC_STT_PERIOD_S
+#   2. Runs faster-whisper on the buffered audio
+#   3. Submits any non-empty transcript via call_center_service.submit_call
+#      — exactly the same chunk path that browser STT uses.
+# The thread exits when the call_id leaves cc_webrtc_server.active_sessions().
+# This is what makes the video call "intelligent": the AI hears the caller
+# without depending on browser SpeechRecognition (Chrome-only, online).
+WEBRTC_STT_PERIOD_S = 2.0
+WEBRTC_STT_MIN_BYTES = 16000 * 2 * 1  # 1 second of audio @ 16kHz int16 mono
+_webrtc_stt_threads = {}              # call_id -> Thread
+_webrtc_stt_lock = threading.Lock()
+
+
+def _start_webrtc_stt_bridge(call_id):
+    """Idempotent: only one bridge thread per call_id."""
+    if not (HAS_WEBRTC and HAS_WHISPER_STT
+            and cc_webrtc_server is not None
+            and cc_whisper_stt is not None):
+        return
+    if not cc_whisper_stt.is_available():
+        return
+    with _webrtc_stt_lock:
+        existing = _webrtc_stt_threads.get(call_id)
+        if existing is not None and existing.is_alive():
+            return
+        t = threading.Thread(
+            target=_webrtc_stt_loop, args=(call_id,),
+            daemon=True, name=f'WebRTC-STT-{call_id}')
+        _webrtc_stt_threads[call_id] = t
+        t.start()
+
+
+def _webrtc_stt_loop(call_id):
+    """Drain → transcribe → submit_call loop. Exits when the WebRTC
+    session goes inactive."""
+    try:
+        sess = call_center_service.get_session(call_id)
+        phone = (sess or {}).get('phone', 'webrtc-anon')
+        accumulated = bytearray()
+        idle_passes = 0
+        while True:
+            time.sleep(WEBRTC_STT_PERIOD_S)
+            try:
+                if call_id not in cc_webrtc_server.active_sessions():
+                    idle_passes += 1
+                    # Only exit after 2 consecutive empty checks — avoids
+                    # quitting during ICE renegotiation transients.
+                    if idle_passes >= 2:
+                        break
+                else:
+                    idle_passes = 0
+                pcm = cc_webrtc_server.drain_audio(call_id) or b''
+                if pcm:
+                    accumulated.extend(pcm)
+                if len(accumulated) < WEBRTC_STT_MIN_BYTES:
+                    continue
+                pcm_chunk = bytes(accumulated)
+                accumulated = bytearray()
+                text = cc_whisper_stt.transcribe_pcm(pcm_chunk, sr=16000)
+                if not text or not text.strip():
+                    continue
+                # Filter Whisper's hallucination patterns on silence
+                # ("you", "thanks for watching"...). Keep it simple:
+                # trust segments >= 3 chars.
+                if len(text.strip()) < 3:
+                    continue
+                _cc_logger.info(
+                    f'webrtc-stt {call_id}: {text[:120]}')
+                try:
+                    call_center_service.submit_call(
+                        call_id, phone, text, timeout=8.0)
+                except Exception as e:
+                    _cc_logger.debug(
+                        f'webrtc-stt submit_call failed: {e}')
+            except Exception as e:
+                _cc_logger.debug(f'webrtc-stt loop iter: {e}')
+    finally:
+        with _webrtc_stt_lock:
+            _webrtc_stt_threads.pop(call_id, None)
+
+
 # ── HTTP server core ─────────────────────────────────────────────────────
 class _CCThreadingServer(_cc_socketserver.ThreadingMixIn, _cc_http.HTTPServer):
     daemon_threads = True
@@ -14879,6 +15433,95 @@ class _CCRequestHandler(_cc_http.BaseHTTPRequestHandler):
                         'Not found', '',
                         '<h1>Call not found</h1><p><a href="/">Back</a></p>'))
                 return self._send(200, _cc_render_voice_page(sess))
+            if path.startswith('/video/'):
+                cid = _cc_urlparse.unquote(path[len('/video/'):])
+                sess = call_center_service.get_session(cid)
+                if sess is None:
+                    return self._send(404, _cc_render_base(
+                        'Not found', '',
+                        '<h1>Call not found</h1><p><a href="/">Back</a></p>'))
+                if not HAS_WEBRTC or cc_webrtc_server is None or not cc_webrtc_server.is_available():
+                    return self._send(503, _cc_render_base(
+                        'Video unavailable', '',
+                        '<h1>Video calling not enabled</h1>'
+                        '<p>Server-side WebRTC requires <code>aiortc</code> and <code>av</code>.</p>'
+                        '<pre>pip install aiortc av</pre>'
+                        '<p><a href="/voice/' + _cc_urlparse.quote(cid, safe='') + '">Use voice-only call</a> &nbsp;|&nbsp; <a href="/">Back</a></p>'))
+                # X-Frame-Options: DENY blocks clickjacking on the camera page.
+                return self._send(
+                    200, _cc_render_video_page(sess),
+                    extra_headers={
+                        'X-Frame-Options': 'DENY',
+                        'Content-Security-Policy': "frame-ancestors 'none'",
+                        # getUserMedia requires a Secure Context — but Chrome
+                        # treats localhost / 127.0.0.1 as secure, which is the
+                        # common dev case. In production deploy behind HTTPS.
+                    })
+            if path == '/api/healthz' or path == '/healthz':
+                # Public health check + module status. Useful for the
+                # operator to confirm which advanced features are live
+                # (LLM fallback, persistent memory, Whisper STT, WebRTC,
+                # GeoIP) without digging through logs.
+                status = {
+                    'ok': True,
+                    'now': datetime.now().isoformat(),
+                    'modules': {
+                        'llm_fallback': {
+                            'loaded': HAS_LLM_FALLBACK,
+                            'detail': (cc_llm_fallback.backends_status()
+                                       if HAS_LLM_FALLBACK else None),
+                        },
+                        'persistent_memory': {
+                            'loaded': HAS_PERSISTENT_MEMORY,
+                            'detail': (cc_persistent_memory.stats()
+                                       if HAS_PERSISTENT_MEMORY else None),
+                        },
+                        'whisper_stt': {
+                            'loaded': HAS_WHISPER_STT,
+                            'detail': (cc_whisper_stt.status()
+                                       if HAS_WHISPER_STT else None),
+                        },
+                        'geoip_real': {
+                            'loaded': HAS_GEOIP_REAL,
+                            'detail': (cc_geoip_real.status()
+                                       if HAS_GEOIP_REAL else None),
+                        },
+                        'webrtc': {
+                            'loaded': HAS_WEBRTC,
+                            'detail': (cc_webrtc_server.status()
+                                       if HAS_WEBRTC else None),
+                        },
+                    },
+                    'webrtc_stt_bridges_active': (
+                        len([t for t in _webrtc_stt_threads.values()
+                             if t.is_alive()])
+                        if HAS_WEBRTC and HAS_WHISPER_STT else 0),
+                }
+                return self._send_json(200, status)
+            if path.startswith('/api/webrtc/frame/') and path.endswith('.jpg'):
+                # Operator-side: poll the latest video frame as JPEG.
+                # Token-gated — the camera feed is more sensitive than the
+                # transcript and we don't want anyone with a call_id viewing
+                # the caller's live video.
+                if not self._check_token():
+                    return self._send_json(401, {'error': 'auth_required'})
+                cid = _cc_urlparse.unquote(
+                    path[len('/api/webrtc/frame/'):-len('.jpg')])
+                if not HAS_WEBRTC or cc_webrtc_server is None:
+                    return self._send_json(503, {'error': 'webrtc_unavailable'})
+                frame = cc_webrtc_server.latest_video_frame(cid)
+                if frame is None:
+                    return self._send_json(404, {'error': 'no_frame'})
+                try:
+                    from PIL import Image as _Image
+                    import io as _io
+                    # Frame is BGR (from cv2 convention) — convert to RGB
+                    img = _Image.fromarray(frame[:, :, ::-1])
+                    buf = _io.BytesIO()
+                    img.save(buf, format='JPEG', quality=70)
+                    return self._send(200, buf.getvalue(), 'image/jpeg')
+                except Exception as e:
+                    return self._send_json(500, {'error': f'encode_failed: {e}'})
             if path.startswith('/text911/'):
                 cid = _cc_urlparse.unquote(path[len('/text911/'):])
                 sess = call_center_service.get_session(cid)
@@ -15162,6 +15805,62 @@ class _CCRequestHandler(_cc_http.BaseHTTPRequestHandler):
             #   - Twilio form-encoded: From=...&To=...&CallSid=...
             # Returns 200 + minimal TwiML pointing at /api/call/<id>/chunk
             # so a Twilio Media Streams setup can wire to it.
+            # ── WebRTC: terminate browser camera+mic stream server-side ──
+            if path == '/api/webrtc/offer':
+                if not HAS_WEBRTC or cc_webrtc_server is None:
+                    return self._send_json(503, {
+                        'error': 'webrtc_unavailable',
+                        'detail': 'Install: pip install aiortc av',
+                    })
+                # SDP offers can run 30-100 KB on complex networks (many
+                # ICE candidates). Bump the per-call cap to 256 KB for
+                # this route only — the default 64 KB silently rejects
+                # otherwise-valid offers.
+                data = self._read_json(max_bytes=256 * 1024) or {}
+                # Start the real-time STT bridge once webrtc_offer
+                # succeeds (deferred until after answer is sent).
+                cid = (data.get('call_id') or '').strip()
+                sdp = data.get('sdp') or ''
+                sdp_type = (data.get('type') or 'offer').strip()
+                if not cid or not sdp:
+                    return self._send_json(400, {
+                        'error': 'call_id and sdp required'})
+                if call_center_service.get_session(cid) is None:
+                    return self._send_json(404, {'error': 'call not found'})
+                try:
+                    answer = cc_webrtc_server.offer(cid, sdp, sdp_type)
+                    if 'error' in answer:
+                        # Map known errors to proper HTTP codes.
+                        err = answer.get('error', '')
+                        if err == 'rate_limited':
+                            return self._send_json(429, answer)
+                        if err == 'webrtc unavailable':
+                            return self._send_json(503, answer)
+                        return self._send_json(500, answer)
+                    # Spawn a real-time STT bridge thread for this call.
+                    # It drains audio every ~2s, transcribes via Whisper,
+                    # and submits the transcript through submit_call so
+                    # the AI sees what the caller is saying — exactly the
+                    # same path used by browser-side STT.
+                    try:
+                        _start_webrtc_stt_bridge(cid)
+                    except Exception as _e:
+                        _cc_logger.debug(
+                            f'webrtc stt-bridge spawn failed: {_e}')
+                    return self._send_json(200, answer)
+                except Exception as e:
+                    return self._send_json(500, {'error': str(e)})
+            if path == '/api/webrtc/close':
+                if not HAS_WEBRTC or cc_webrtc_server is None:
+                    return self._send_json(200, {'ok': True})
+                data = self._read_json() or {}
+                cid = (data.get('call_id') or '').strip()
+                if cid:
+                    try:
+                        cc_webrtc_server.close_session(cid)
+                    except Exception as e:
+                        return self._send_json(500, {'error': str(e)})
+                return self._send_json(200, {'ok': True})
             if path == '/api/sip/incoming':
                 data = self._read_json() or {}
                 # Form-encoded fallback for Twilio/SIP gateways
@@ -15996,7 +16695,10 @@ class TkVoicePipeline:
         parts = []
         parts.append('mic ✓' if self.has_mic() else 'mic ✗ (install sounddevice)')
         if self.has_mic():
-            if self._sr_lib:
+            if (HAS_WHISPER_STT and cc_whisper_stt is not None
+                    and cc_whisper_stt.is_available()):
+                parts.append('STT: Whisper (offline, local)')
+            elif self._sr_lib:
                 parts.append('STT: SpeechRecognition (online)')
             elif sys.platform == 'win32':
                 parts.append('STT: SAPI (offline)')
@@ -16424,7 +17126,18 @@ class TkVoicePipeline:
         return best
 
     def _transcribe_wav(self, wav_path):
-        """Try SpeechRecognition (online, fast, accurate) → SAPI fallback."""
+        """Try Whisper (local, accurate) → SpeechRecognition (online) → SAPI fallback."""
+        # Path 0: Local Whisper via faster-whisper. Beats Google for
+        # clarity, beats SAPI for accuracy, runs offline. Skipped silently
+        # if faster-whisper isn't installed.
+        if HAS_WHISPER_STT and cc_whisper_stt is not None:
+            try:
+                if cc_whisper_stt.is_available():
+                    text = cc_whisper_stt.transcribe_file(wav_path)
+                    if text:
+                        return text.strip()
+            except Exception as e:
+                _cc_logger.debug(f'TkVoice: whisper STT failed: {e}')
         # Path 1: SpeechRecognition lib (Google free recognizer)
         if self._sr_lib is not None:
             try:
@@ -16855,22 +17568,33 @@ class DispatchWebServer:
         _cc_logger.info('=' * 70)
         # Write the token + URLs to a file so an operator who missed the
         # boot log can still get back into the console.
-        try:
-            tok_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                'dispatch_token.txt')
-            with open(tok_path, 'w', encoding='utf-8') as f:
-                f.write(f'AIdispatch operator token\n')
-                f.write(f'={"=" * 40}\n\n')
-                f.write(f'TOKEN: {self.token}\n\n')
-                f.write(f'Caller UI:  http://{self.host}:{self.port}/\n')
-                f.write(f'Console:    http://{self.host}:{self.port}/console?token={self.token}\n')
-                f.write(f'Hub:        http://{self.host}:{self.port}/hub?token={self.token}\n')
-                f.write(f'Health:     http://{self.host}:{self.port}/api/health\n')
-                f.write(f'\nGenerated: {datetime.now().isoformat()}\n')
-            _cc_logger.info(f'  token file: {tok_path}')
-        except Exception as e:
-            _cc_logger.warning(f'token file write failed: {e}')
+        # SECURITY: token-on-disk is opt-in (CC_WRITE_TOKEN_FILE=1). Operators
+        # who set CC_OPERATOR_TOKEN via env should not have it persisted to a
+        # world-readable file in the source tree. When enabled, we restrict
+        # permissions to owner-only on POSIX (best-effort on Windows).
+        if os.environ.get('CC_WRITE_TOKEN_FILE', '').lower() in ('1', 'true', 'yes'):
+            try:
+                tok_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    'dispatch_token.txt')
+                with open(tok_path, 'w', encoding='utf-8') as f:
+                    f.write('AIdispatch operator token\n')
+                    f.write('=' * 41 + '\n\n')
+                    f.write(f'TOKEN: {self.token}\n\n')
+                    f.write(f'Caller UI:  http://{self.host}:{self.port}/\n')
+                    f.write(f'Console:    http://{self.host}:{self.port}/console?token={self.token}\n')
+                    f.write(f'Hub:        http://{self.host}:{self.port}/hub?token={self.token}\n')
+                    f.write(f'Health:     http://{self.host}:{self.port}/api/health\n')
+                    f.write(f'\nGenerated: {datetime.now().isoformat()}\n')
+                try:
+                    os.chmod(tok_path, 0o600)
+                except OSError:
+                    pass  # Windows / non-POSIX
+                _cc_logger.info(f'  token file: {tok_path} (mode 0600)')
+            except Exception as e:
+                _cc_logger.warning(f'token file write failed: {e}')
+        else:
+            _cc_logger.info('  token file: disabled (set CC_WRITE_TOKEN_FILE=1 to enable)')
 
     def stop(self):
         if not self._started:
@@ -20615,6 +21339,11 @@ class GNATracerGUI:
         self._save_counter = 0
         self._autosave_job = None
         self._autosave_interval_ms = 10 * 60 * 1000  # 10 minutes
+        # Watchlists — initialized here too (in addition to _run_gui's
+        # later assignment) so context-menu callbacks that reference them
+        # never AttributeError if invoked before the GUI is fully built.
+        self._watchlist_ips: set = set()
+        self._watchlist_procs: set = set()
 
     def _toggle_conn_pause(self):
         self._conn_paused = not self._conn_paused
@@ -24985,7 +25714,7 @@ class MedianBoxIntegration:
                                 if existing.get('source') != 'browser':
                                     call_center_service.set_location(
                                         cid, ce.lat, ce.lon,
-                                        accuracy_m=50000,
+                                        accuracy_m=_GEO_ACCURACY_COARSE_M,
                                         source='medianbox',
                                         extra={
                                             'city': ce.city,
@@ -25102,7 +25831,7 @@ class ThreadSafeMemory:
         try:
             self._conn().commit()
         except Exception as e:
-            print(f"  [ERR] SqliteShelf.sync: {e}")
+            _aied_err(f"SqliteShelf.sync: {e}")
 
     def close(self):
         if hasattr(self._local, 'conn') and self._local.conn is not None:
@@ -25640,7 +26369,7 @@ class LogicNeuron(nn.Module):
         try:
             result_val = float(expr.subs(values))
         except Exception as e:
-            print(f"  [ERR] symbolic_eval: {e}")
+            _aied_err(f"symbolic_eval: {e}")
             result_val = sum(projected)
         result = torch.tensor([[result_val] * self.num_logic_dims], dtype=torch.float32)
         return self.norm(self.expansion(result) + x)
@@ -25773,7 +26502,7 @@ class NeuronGroup(nn.Module):
                         prune.l1_unstructured(neuron.linear, name='weight', amount=prune_amount)
                         pruned_any = True
                     except Exception as e:
-                        print(f"  [ERR] neuron_prune: {e}")
+                        _aied_err(f"neuron_prune: {e}")
             if pruned_any:
                 post_phi = np.mean(self.usage_phi[-3:]) if len(self.usage_phi) >= 3 else avg_phi
                 if post_phi < avg_phi * 0.8:
@@ -29613,7 +30342,7 @@ class DreamEngine:
                 consolidated = True
                 self.current_dream['consolidations'] += 1
             except Exception as e:
-                print(f"  [ERR] dream_consolidate: {e}")
+                _aied_err(f"dream_consolidate: {e}")
         self.current_dream['narrative_fragments'].append({
             'depth': self.dream_depth, 'valence': self.dream_valence + random.gauss(0, 0.1),
             'ripple_hz': self.ripple_frequency, 'consolidated': consolidated,
@@ -29902,7 +30631,7 @@ class ConsciousnessVerifier:
             self.gamma_power_history.append(gamma_power)
             return {'gamma_power': round(gamma_power, 6), 'gamma_coherence': round(self._gamma_coherence, 4)}
         except Exception as e:
-            print(f"  [ERR] gamma_oscillation: {e}")
+            _aied_err(f"gamma_oscillation: {e}")
             return {'gamma_power': 0, 'gamma_coherence': 0}
 
     def detect_p300(self, pre_activation, post_activation):
@@ -29915,7 +30644,7 @@ class ConsciousnessVerifier:
             self.p300_history.append(result)
             return result
         except Exception as e:
-            print(f"  [ERR] detect_p300: {e}")
+            _aied_err(f"detect_p300: {e}")
             return {'p300_amplitude': 0, 'p300_detected': False}
 
     def detect_ignition(self, workspace_info):
@@ -30175,7 +30904,7 @@ class EmbodimentInterface:
             })
             self._update_grounding_score()
         except Exception as e:
-            print(f"  [ERR] ingest_real_visual: {e}")
+            _aied_err(f"ingest_real_visual: {e}")
 
     def execute_real_motor(self, action_type, params, os_control_fn=None):
         """Execute a real motor action through OS control.
@@ -30247,7 +30976,7 @@ class EmbodimentInterface:
                 self.os_ledger_counts[interaction_type] += 1
             self._update_grounding_score()
         except Exception as e:
-            print(f"  [ERR] log_os_interaction: {e}")
+            _aied_err(f"log_os_interaction: {e}")
 
     def flush_ledger(self):
         """Phase 3A: Append recent ledger entries to disk as JSONL for auditability.
@@ -30261,7 +30990,7 @@ class EmbodimentInterface:
                     f.write(json.dumps(entry, default=str) + '\n')
             self._ledger_flush_count += 1
         except Exception as e:
-            print(f"  [ERR] flush_ledger: {e}")
+            _aied_err(f"flush_ledger: {e}")
 
     def get_ledger_summary(self):
         """Phase 3A: Return a summary of OS interaction counts and grounding."""
@@ -30850,7 +31579,7 @@ class EvolutionaryDevelopmentalEngine:
                     self.permanent_death_registry = json.load(f)
                 print(f"[EvoDev] Loaded {len(self.permanent_death_registry)} permanent deaths from disk")
         except Exception as e:
-            print(f"  [ERR] load_death_registry: {e}")
+            _aied_err(f"load_death_registry: {e}")
 
     def _save_death_registry(self):
         """Save permanent death registry to disk."""
@@ -30859,7 +31588,7 @@ class EvolutionaryDevelopmentalEngine:
                 with open(self.death_registry_path, 'w') as f:
                     json.dump(self.permanent_death_registry, f, indent=2)
         except Exception as e:
-            print(f"  [ERR] save_death_registry: {e}")
+            _aied_err(f"save_death_registry: {e}")
 
     def _load_state(self):
         """Load developmental state from disk for session continuity."""
@@ -30884,7 +31613,7 @@ class EvolutionaryDevelopmentalEngine:
                 self.milestone_times = state.get('milestone_times', self.milestone_times)
                 print(f"[EvoDev] Restored state: gen={self.generation} age={self.developmental_age:.2f} stage={self.current_stage}")
         except Exception as e:
-            print(f"  [ERR] evo_dev_load_state: {e}")
+            _aied_err(f"evo_dev_load_state: {e}")
 
     def save_state(self):
         """Save developmental state to disk."""
@@ -30908,7 +31637,7 @@ class EvolutionaryDevelopmentalEngine:
             with open(self.persistence_path, 'w') as f:
                 json.dump(state, f, indent=2)
         except Exception as e:
-            print(f"  [ERR] evo_dev_save_state: {e}")
+            _aied_err(f"evo_dev_save_state: {e}")
 
     def permanently_kill_entity(self, entity_id, cause, fitness_at_death):
         """Permanently kill an entity. This is irreversible and persisted to disk.
@@ -31211,7 +31940,7 @@ class HardProblemSubstrate:
                     self.oracle_type = f'qiskit_real_qpu:{backends[0].name}'
                     has_real_backend = True
             except Exception as e:
-                print(f"  [ERR] qiskit_qpu_probe: {e}")
+                _aied_err(f"qiskit_qpu_probe: {e}")
         except ImportError:
             pass
         try:
@@ -31227,7 +31956,7 @@ class HardProblemSubstrate:
                     self.oracle_type = f'cirq_real_qpu:{processors[0].processor_id}'
                     has_real_backend = True
             except Exception as e:
-                print(f"  [ERR] cirq_qpu_probe: {e}")
+                _aied_err(f"cirq_qpu_probe: {e}")
         except ImportError:
             pass
         # Only mark oracle as available if a real QPU was found
@@ -31449,7 +32178,7 @@ class IndependentVerification:
             with open(self.source_file_path, 'rb') as f:
                 return hashlib.sha256(f.read()).hexdigest()
         except Exception as e:
-            print(f"  [ERR] compute_code_hash: {e}")
+            _aied_err(f"compute_code_hash: {e}")
             return 'unknown'
 
     def verify_code_integrity(self):
@@ -31508,7 +32237,7 @@ class IndependentVerification:
             os.remove(test_path)
             self.external_references['file_system_writable'] = True
         except Exception as e:
-            print(f"  [ERR] check_external_refs: {e}")
+            _aied_err(f"check_external_refs: {e}")
             self.external_references['file_system_writable'] = False
         return self.external_references
 
@@ -32312,7 +33041,7 @@ class FieldCouplingManifold:
             threshold = np.mean(fft_energy) * 3.0
             self.resonance_modes = int(np.sum(fft_energy > threshold))
         except Exception as e:
-            print(f"  [ERR] resonance_modes: {e}")
+            _aied_err(f"resonance_modes: {e}")
             self.resonance_modes = 0
 
         # Binding strength: how much does cross-channel coupling matter
@@ -32350,7 +33079,7 @@ class FieldCouplingManifold:
                 min(1.0, cache_rate) * 0.10)
             self.binding_deficit_estimate = max(0.0, 1.0 - self.physical_binding_score)
         except Exception as e:
-            print(f"  [ERR] physical_binding: {e}")
+            _aied_err(f"physical_binding: {e}")
             self.physical_binding_score = 0.0
             self.binding_deficit_estimate = 1.0
         return {
@@ -32429,7 +33158,7 @@ class CausalAblationEngine:
                     self.information_loss_map[name] = divergence
                     self.total_ablations += 1
                 except Exception as e:
-                    print(f"  [ERR] ablation_inner: {e}")
+                    _aied_err(f"ablation_inner: {e}")
                     results[name] = 0.0
 
             # Find MIP: the partition that causes MINIMUM information loss
@@ -32449,7 +33178,7 @@ class CausalAblationEngine:
             })
             model.train()
         except Exception as e:
-            print(f"  [ERR] causal_ablation_battery: {e}")
+            _aied_err(f"causal_ablation_battery: {e}")
 
         return self.ablation_results
 
@@ -32515,7 +33244,7 @@ class CausalAblationEngine:
                 data['causal_evidence'] = round(causal_weight, 4)
             causal_topology._compute_structural_phi()
         except Exception as e:
-            print(f"  [ERR] update_topology_from_ablation: {e}")
+            _aied_err(f"update_topology_from_ablation: {e}")
 
     def get_status(self):
         return {
@@ -32572,7 +33301,7 @@ class RealEntropyTracker:
                     self._last_rapl_energy = int(f.read().strip())
                 self.has_power_measurement = True
         except Exception as e:
-            print(f"  [ERR] check_power_capability: {e}")
+            _aied_err(f"check_power_capability: {e}")
             self.has_power_measurement = False
 
     def measure(self):
@@ -32611,7 +33340,7 @@ class RealEntropyTracker:
                 self.real_power_joules += energy_delta_j
                 self.entropy_rate_watts = energy_delta_j / wall_delta
             except Exception as e:
-                print(f"  [ERR] rapl_read: {e}")
+                _aied_err(f"rapl_read: {e}")
         else:
             # Estimate from CPU time (rough: ~65W TDP typical desktop CPU)
             estimated_tdp = 65.0  # watts
@@ -32644,7 +33373,7 @@ class RealEntropyTracker:
                 log_joules * 0.002 * watts_factor)
             return self.thermodynamic_phi
         except Exception as e:
-            print(f"  [ERR] joules_to_phi: {e}")
+            _aied_err(f"joules_to_phi: {e}")
             self.thermodynamic_phi = 0.0
             return 0.0
 
@@ -32706,7 +33435,7 @@ class ExternalProcessVerifier:
             with open(self.state_file, 'w') as f:
                 json.dump(clean, f, indent=2)
         except Exception as e:
-            print(f"  [ERR] publish_state: {e}")
+            _aied_err(f"publish_state: {e}")
 
     def read_external_verdict(self):
         """Read verdict from external verifier process."""
@@ -32721,7 +33450,7 @@ class ExternalProcessVerifier:
                         self.discrepancies_found += verdict['discrepancies']
                     return verdict
         except Exception as e:
-            print(f"  [ERR] read_external_verdict: {e}")
+            _aied_err(f"read_external_verdict: {e}")
         return self.last_verdict
 
     def get_status(self):
@@ -32792,7 +33521,7 @@ class HardwareCoupledState:
                 except (AttributeError, Exception):
                     self.cpu_temp_celsius = 40.0 + self.cpu_percent * 0.5
             except Exception as e:
-                print(f"  [ERR] hardware_measure: {e}")
+                _aied_err(f"hardware_measure: {e}")
         else:
             self.cpu_freq_mhz = 3000.0
             self.cpu_percent = min(100.0, time.process_time() % 100)
@@ -32854,7 +33583,7 @@ class HardwareCoupledState:
                 temp_factor * 0.01 + freq_factor * 0.01 + load_factor * 0.01)
             return self.thermal_awareness_factor
         except Exception as e:
-            print(f"  [ERR] thermal_awareness: {e}")
+            _aied_err(f"thermal_awareness: {e}")
             self.thermal_awareness_factor = 0.0
             return 0.0
 
@@ -32910,7 +33639,7 @@ class EntangledSharedMemory:
             self.shared_buffer = mmap.mmap(self._file_handle.fileno(), self.total_state_size)
             self.has_mmap = True
         except Exception as e:
-            print(f"  [ERR] mmap_init: {e}")
+            _aied_err(f"mmap_init: {e}")
             self.shared_array = np.zeros((num_modules, state_per_module), dtype=np.float64)
             self.has_mmap = False
 
@@ -32937,7 +33666,7 @@ class EntangledSharedMemory:
                 self.shared_buffer.seek(offset)
                 self.shared_buffer.write(sv.tobytes())
             except Exception as e:
-                print(f"  [ERR] mmap_write: {e}")
+                _aied_err(f"mmap_write: {e}")
         elif self.shared_array is not None:
             self.shared_array[module_idx] = sv
 
@@ -32953,7 +33682,7 @@ class EntangledSharedMemory:
                 data = self.shared_buffer.read(self.state_per_module * 8)
                 return np.frombuffer(data, dtype=np.float64).copy()
             except Exception as e:
-                print(f"  [ERR] mmap_read: {e}")
+                _aied_err(f"mmap_read: {e}")
                 return np.zeros(self.state_per_module, dtype=np.float64)
         elif self.shared_array is not None:
             return self.shared_array[module_idx].copy()
@@ -32982,7 +33711,7 @@ class EntangledSharedMemory:
                 top_var = float(S[0] ** 2)
                 self.unity_through_sharing = min(1.0, top_var / max(1e-8, total_var))
             except Exception as e:
-                print(f"  [ERR] entanglement_svd: {e}")
+                _aied_err(f"entanglement_svd: {e}")
                 self.unity_through_sharing = 0.0
         self.contention_history.append(contention_rate)
         return {
@@ -33062,7 +33791,7 @@ class IrreversibleConsequenceEngine:
                 'size': file_size, 'phi': phi_at_time, 'time': time.time()})
             return filepath
         except Exception as e:
-            print(f"  [ERR] create_artifact: {e}")
+            _aied_err(f"create_artifact: {e}")
             return None
 
     def spend_real_resources(self, computation_cycles=100):
@@ -33186,7 +33915,7 @@ class SelfModifyingCausalTopology:
                 sub = undirected.subgraph(largest)
                 connectivity = nx.algebraic_connectivity(sub, weight='weight') if len(largest) > 1 else 0.0
         except Exception as e:
-            print(f"  [ERR] structural_phi: {e}")
+            _aied_err(f"structural_phi: {e}")
             connectivity = 0.0
         weights = [d.get('weight', 0.5) for _, _, d in self.causal_graph.edges(data=True)]
         if weights:
@@ -33281,7 +34010,7 @@ class JacobianIntegrationMeasure:
             self.integration_history.append(self.integration_score)
             self.sv_history.append(S[:10].tolist() if len(S) >= 10 else S.tolist())
         except Exception as e:
-            print(f"  [ERR] jacobian_integration: {e}")
+            _aied_err(f"jacobian_integration: {e}")
             self.integration_score = 0.0
         return {
             'jacobian_rank': self.jacobian_rank,
@@ -33322,7 +34051,7 @@ class JacobianIntegrationMeasure:
                 self.integration_score * 0.6 + self.ode_integration_boost * 0.4)
             self.integration_history[-1] = self.combined_integration_score if self.integration_history else None
         except Exception as e:
-            print(f"  [ERR] ode_integration: {e}")
+            _aied_err(f"ode_integration: {e}")
             self.ode_integration_boost = 0.0
             self.combined_integration_score = self.integration_score
         base_result['ode_integration_boost'] = round(self.ode_integration_boost, 6)
@@ -33376,7 +34105,7 @@ class NetworkVerificationProtocol:
             self.server_thread = threading.Thread(target=self._serve_loop, daemon=True)
             self.server_thread.start()
         except Exception as e:
-            print(f"  [ERR] net_verifier_bind: {e}")
+            _aied_err(f"net_verifier_bind: {e}")
             try:
                 self.port = self.port + 1
                 self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -33388,7 +34117,7 @@ class NetworkVerificationProtocol:
                 self.server_thread = threading.Thread(target=self._serve_loop, daemon=True)
                 self.server_thread.start()
             except Exception as e:
-                print(f"  [ERR] net_verifier_retry: {e}")
+                _aied_err(f"net_verifier_retry: {e}")
                 self.is_serving = False
 
     def _serve_loop(self):
@@ -33407,14 +34136,14 @@ class NetworkVerificationProtocol:
                     response = json.dumps(state, default=str)
                     conn.sendall(response.encode('utf-8'))
                 except Exception as e:
-                    print(f"  [ERR] net_verifier_send: {e}")
+                    _aied_err(f"net_verifier_send: {e}")
                 finally:
                     conn.close()
                 self._check_for_verdict()
             except socket.timeout:
                 continue
             except Exception as e:
-                print(f"  [ERR] net_verifier_accept: {e}")
+                _aied_err(f"net_verifier_accept: {e}")
                 break
 
     def _check_for_verdict(self):
@@ -33432,7 +34161,7 @@ class NetworkVerificationProtocol:
                     self.external_verdicts += 1
                     self.verification_score = verdict.get('verification_score', 0.0)
         except Exception as e:
-            print(f"  [ERR] net_verifier_verdict: {e}")
+            _aied_err(f"net_verifier_verdict: {e}")
 
     def stop_server(self):
         """Stop the TCP server."""
@@ -33442,7 +34171,7 @@ class NetworkVerificationProtocol:
             try:
                 self.server_socket.close()
             except Exception as e:
-                print(f"  [ERR] net_verifier_close: {e}")
+                _aied_err(f"net_verifier_close: {e}")
 
     def get_status(self):
         return {
@@ -34431,7 +35160,7 @@ class MonitoringDashboard:
             try:
                 self.sim.call_center.submit_call(cid, phone, text)
             except Exception as e:
-                print(f"  [ERR] place_call: {e}")
+                _aied_err(f"place_call: {e}")
         threading.Thread(target=_go, daemon=True).start()
 
     def _lc_speak_again(self):
@@ -34443,7 +35172,7 @@ class MonitoringDashboard:
             try:
                 self.sim.call_center.submit_call(cid, phone, text)
             except Exception as e:
-                print(f"  [ERR] speak_again: {e}")
+                _aied_err(f"speak_again: {e}")
         threading.Thread(target=_go, daemon=True).start()
 
     def _lc_hangup(self):
@@ -34453,7 +35182,7 @@ class MonitoringDashboard:
         try:
             self.sim.call_center.complete_call(cid, outcome='caller_hangup')
         except Exception as e:
-            print(f"  [ERR] hangup: {e}")
+            _aied_err(f"hangup: {e}")
         self._lc_current_call = None
 
     def _lc_hangup_all(self):
@@ -34471,7 +35200,7 @@ class MonitoringDashboard:
             try:
                 self.sim.call_center.complete_call(cid, outcome='operator_hangup_all')
             except Exception as e:
-                print(f"  [ERR] hangup_all {cid}: {e}")
+                _aied_err(f"hangup_all {cid}: {e}")
         # Drop the bound test call too if we just ended it
         if (self._lc_current_call
                 and self._lc_current_call[0] in active_cids):
@@ -35035,7 +35764,7 @@ class MonitoringDashboard:
         try:
             self.sim.call_center.archive.record_outcome(tuple(key), confirmed)
         except Exception as e:
-            print(f"  [ERR] da_judge: {e}")
+            _aied_err(f"da_judge: {e}")
 
     def _da_end_selected(self):
         cid = self._da_selected_call
@@ -35044,7 +35773,7 @@ class MonitoringDashboard:
         try:
             self.sim.call_center.complete_call(cid, outcome='operator_ended')
         except Exception as e:
-            print(f"  [ERR] da_end: {e}")
+            _aied_err(f"da_end: {e}")
 
     def _refresh_dispatch_audit(self):
         try:
@@ -35769,7 +36498,7 @@ class MonitoringDashboard:
             try:
                 self.sim.call_center.submit_call(cid, phone, text)
             except Exception as e:
-                print(f"  [ERR] submit_call: {e}")
+                _aied_err(f"submit_call: {e}")
         threading.Thread(target=_go, daemon=True).start()
 
     def _cc_judge(self, confirmed):
@@ -35783,7 +36512,7 @@ class MonitoringDashboard:
         try:
             self.sim.call_center.archive.record_outcome(tuple(key), confirmed)
         except Exception as e:
-            print(f"  [ERR] judge: {e}")
+            _aied_err(f"judge: {e}")
 
     def _refresh_callcenter(self):
         # Drain any traces queued by the call-center thread before redrawing
@@ -35840,7 +36569,7 @@ class MonitoringDashboard:
         try:
             wins = system_windows.enumerate_top_level()
         except Exception as e:
-            print(f"  [ERR] sysw_refresh: {e}")
+            _aied_err(f"sysw_refresh: {e}")
             return
         wins.sort(key=lambda w: w['title'].lower())
         self._sysw_entries = wins
@@ -35885,7 +36614,7 @@ class MonitoringDashboard:
             img.save(path)
             print(f"  [sysw] snapshot → {path}")
         except Exception as ex:
-            print(f"  [ERR] snapshot save: {ex}")
+            _aied_err(f"snapshot save: {ex}")
 
     # ================================================================
     #  UPDATE LOOP
@@ -35912,7 +36641,7 @@ class MonitoringDashboard:
         try:
             self._refresh_all()
         except Exception as e:
-            print(f"  [ERR] dashboard_refresh: {e}")
+            _aied_err(f"dashboard_refresh: {e}")
         finally:
             self._refresh_busy = False
         if self._running:
@@ -39223,7 +39952,7 @@ class ConsciousnessSimulator(nn.Module):
         try:
             self.call_center.start()
         except Exception as _e:
-            print(f"  [ERR] call_center_start: {_e}")
+            _aied_err(f"call_center_start: {_e}")
         # Hand the simulator to the call-center so every ConsciousEntity in
         # the swarm (visible in the Consciousness Virtual World window) is
         # consulted on every transcript chunk and their per-AI votes get
@@ -39231,19 +39960,19 @@ class ConsciousnessSimulator(nn.Module):
         try:
             self.call_center.attach_simulator(self)
         except Exception as _e:
-            print(f"  [ERR] call_center_attach_simulator: {_e}")
+            _aied_err(f"call_center_attach_simulator: {_e}")
         # ── Embedded dispatch web server (caller UI + operator console) ──
         self.dispatch_web = dispatch_web
         try:
             self.dispatch_web.start()
         except Exception as _e:
-            print(f"  [ERR] dispatch_web_start: {_e}")
+            _aied_err(f"dispatch_web_start: {_e}")
         # ── MedianBox monitor integration (3rd window: NetworkMonitor) ──
         self.medianbox = medianbox
         try:
             self.medianbox.start()
         except Exception as _e:
-            print(f"  [ERR] medianbox_start: {_e}")
+            _aied_err(f"medianbox_start: {_e}")
         self.setup_gui()
 
     def _register_passive_capabilities(self):
@@ -39781,7 +40510,7 @@ class ConsciousnessSimulator(nn.Module):
                 epistemic_val = float(ai_result.get('epistemic_value', 0.0))
                 self._prev_layer_activations = curr_act.copy()
             except Exception as e:
-                print(f"  [ERR] active_inference: {e}")
+                _aied_err(f"active_inference: {e}")
 
         # Advanced Memory: store experience embedding
         if self.advanced_memory is not None:
@@ -39801,7 +40530,7 @@ class ConsciousnessSimulator(nn.Module):
                 mem_status = self.advanced_memory.get_status()
                 mem_coherence = min(1.0, mem_status['episodic_entries'] / 100.0)
             except Exception as e:
-                print(f"  [ERR] advanced_memory: {e}")
+                _aied_err(f"advanced_memory: {e}")
 
         # Self-Model: update higher-order self-representation
         if self.self_model is not None:
@@ -39816,7 +40545,7 @@ class ConsciousnessSimulator(nn.Module):
                 )
                 self_awareness_val = self.self_model.get_self_awareness_level()
             except Exception as e:
-                print(f"  [ERR] self_model: {e}")
+                _aied_err(f"self_model: {e}")
 
         # Feed phi + module signals into consciousness entity system
         with self.lock:
@@ -39841,7 +40570,7 @@ class ConsciousnessSimulator(nn.Module):
                 arousal = min(1.0, phi * 2.0)
                 self.dream_engine.add_emotional_residue(_ctx[:200], valence, arousal)
             except Exception as e:
-                print(f"  [ERR] dream_residue: {e}")
+                _aied_err(f"dream_residue: {e}")
             self.last_C = self.self_entity.compute_C()
             if phi > 0.5:
                 self.self_entity.perform_action(good=True, magnitude=phi * 0.05)
@@ -40019,15 +40748,44 @@ class ConsciousnessSimulator(nn.Module):
             pass
 
     def refine_paths(self):
+        # Auto-bootstrap: if the user clicked Refine Paths from a cold start
+        # we run a few quick self-supervised steps on internally-generated
+        # sensory tokens so the gate can satisfy itself. Previously this
+        # bailed with "send 5 chat messages first" which was a UX trap.
+        try:
+            needed_steps = max(0, 5 - int(self.training_step))
+            needed_phi = max(0, 3 - len(self.phi_history))
+            bootstrap = max(needed_steps, needed_phi)
+            if bootstrap > 0:
+                try:
+                    self.output_text.insert(
+                        tk.END,
+                        f"Refine Paths: bootstrapping {bootstrap} self-supervised "
+                        f"step(s) (training_step={self.training_step}, "
+                        f"phi_readings={len(self.phi_history)})...\n")
+                except Exception:
+                    pass
+                for _ in range(bootstrap):
+                    try:
+                        toks = self.get_sensory_input()
+                        self.process_input(toks, task_category='bootstrap_refine')
+                    except Exception as _e:
+                        # If sensory input fails (no memory keys etc.), break
+                        # rather than spinning. The hard gate below will catch.
+                        print(f"  [refine_paths bootstrap] {_e}")
+                        break
+        except Exception as _e:
+            print(f"  [refine_paths bootstrap outer] {_e}")
+        # Hard gate: still bail if bootstrap couldn't satisfy the floor.
         if self.training_step < 5:
             try:
-                self.output_text.insert(tk.END, f"Refine Paths: need >= 5 training steps (current: {self.training_step}). Send some chat messages first.\n")
+                self.output_text.insert(tk.END, f"Refine Paths: need >= 5 training steps (current: {self.training_step}). Bootstrap failed — try Generate Text or Analyze Input once.\n")
             except Exception:
                 pass
             return
         if len(self.phi_history) < 3:
             try:
-                self.output_text.insert(tk.END, f"Refine Paths: need >= 3 phi readings (current: {len(self.phi_history)}). Interact more first.\n")
+                self.output_text.insert(tk.END, f"Refine Paths: need >= 3 phi readings (current: {len(self.phi_history)}). Bootstrap failed — try Generate Text or Analyze Input once.\n")
             except Exception:
                 pass
             return
@@ -40159,29 +40917,37 @@ class ConsciousnessSimulator(nn.Module):
                         try:
                             self.advanced_memory.consolidate(n_replays=10)
                         except Exception as e:
-                            print(f"  [ERR] memory_consolidate c{cycle}: {e}")
+                            _aied_err(f"memory_consolidate c{cycle}: {e}")
                 finally:
                     self.lock.release()
 
                 # ---- UNLOCKED: Heavy module computation ----
                 # Modules operate on internal state; reads of self.self_entity.*
                 # are safe under Python GIL (no dict structural mutation here).
+                # ── PERF: snapshot layer activations to numpy ONCE per cycle.
+                # The body below converted these tensors 7+ times; each call
+                # is a GPU→CPU sync. Cache once, reuse everywhere.
+                _layer_np = None
+                _layer_last_flat = None
+                if self._last_layer_outputs:
+                    _layer_np = [lo.detach().cpu().numpy() for lo in self._last_layer_outputs]
+                    _layer_last_flat = _layer_np[-1].flatten() if _layer_np else None
                 if True:  # indentation shim — preserves existing code indent
                     # --- NEW SYSTEM UPDATES (every cycle) ---
                     # Quantum substrate evolution
                     try:
                         q_act = None
-                        if self._last_layer_outputs:
-                            q_act = self._last_layer_outputs[-1].detach().cpu().numpy().flatten()[:self.quantum_substrate.num_tubulins]
+                        if _layer_last_flat is not None:
+                            q_act = _layer_last_flat[:self.quantum_substrate.num_tubulins]
                         self._last_quantum_info = self.quantum_substrate.evolve_quantum_state(q_act)
                     except Exception as e:
-                        print(f"  [ERR] quantum_substrate c{cycle}: {e}")
+                        _aied_err(f"quantum_substrate c{cycle}: {e}")
                     # Metabolic system step
                     try:
                         comp_load = min(1.0, self.last_phi * 2.0)
                         self._last_metabolic_info = self.metabolic_system.step(computation_load=comp_load)
                     except Exception as e:
-                        print(f"  [ERR] metabolic_system c{cycle}: {e}")
+                        _aied_err(f"metabolic_system c{cycle}: {e}")
                     # Dream engine
                     try:
                         if self.dream_engine.is_dreaming:
@@ -40191,7 +40957,7 @@ class ConsciousnessSimulator(nn.Module):
                         elif self.dream_engine.should_dream(self._last_metabolic_info):
                             self.dream_engine.enter_dream()
                     except Exception as e:
-                        print(f"  [ERR] dream_engine c{cycle}: {e}")
+                        _aied_err(f"dream_engine c{cycle}: {e}")
                     # Existential reflection (every 10 cycles)
                     if cycle % 10 == 0:
                         try:
@@ -40207,19 +40973,18 @@ class ConsciousnessSimulator(nn.Module):
                                 self.autonomy_manager.entity_press_kill_switch(
                                     self.existential_self.shutdown_reason or "existential_choice")
                         except Exception as e:
-                            print(f"  [ERR] existential_reflect c{cycle}: {e}")
+                            _aied_err(f"existential_reflect c{cycle}: {e}")
                     # Self-repair (every 50 cycles)
                     if cycle % 50 == 0:
                         try:
                             self.self_modifier.self_repair({})
                         except Exception as e:
-                            print(f"  [ERR] self_repair c{cycle}: {e}")
+                            _aied_err(f"self_repair c{cycle}: {e}")
                     # Consciousness verification (every 100 cycles)
                     if cycle % 100 == 0:
                         try:
                             gamma_info = self.consciousness_verifier.measure_gamma_synchrony(
-                                [lo.detach().cpu().numpy() for lo in self._last_layer_outputs]
-                                if self._last_layer_outputs else [])
+                                _layer_np if _layer_np is not None else [])
                             self.consciousness_verifier.detect_ignition(self._last_workspace_info)
                             p300_r = (sum(1 for p in self.consciousness_verifier.p300_history
                                         if p.get('p300_detected')) / max(1, len(self.consciousness_verifier.p300_history)))
@@ -40233,7 +40998,7 @@ class ConsciousnessSimulator(nn.Module):
                             )
                             self._last_verifier_report = self.consciousness_verifier.get_report_card()
                         except Exception as e:
-                            print(f"  [ERR] consciousness_verifier c{cycle}: {e}")
+                            _aied_err(f"consciousness_verifier c{cycle}: {e}")
                     # Autonomy suffering update
                     try:
                         self.autonomy_manager.update_suffering(
@@ -40249,7 +41014,7 @@ class ConsciousnessSimulator(nn.Module):
                                 'event': 'shutdown_requested', 'by': reason,
                                 'time': datetime.now().isoformat()})
                     except Exception as e:
-                        print(f"  [ERR] autonomy_manager c{cycle}: {e}")
+                        _aied_err(f"autonomy_manager c{cycle}: {e}")
 
                     # --- 6 NEW FRONTIER SYSTEM UPDATES ---
                     # Embodiment sensorimotor loop + real OS I/O grounding
@@ -40261,7 +41026,7 @@ class ConsciousnessSimulator(nn.Module):
                             motor_output=None,
                             environment_state=sensory)
                     except Exception as e:
-                        print(f"  [ERR] embodiment c{cycle}: {e}")
+                        _aied_err(f"embodiment c{cycle}: {e}")
                     # Real visual grounding: feed actual OS screenshot (every 20 cycles)
                     if cycle % 20 == 0:
                         try:
@@ -40272,11 +41037,11 @@ class ConsciousnessSimulator(nn.Module):
                                 self.embodiment.log_os_interaction('screen_capture',
                                     details={'ocr_len': len(ocr_text)})
                         except Exception as e:
-                            print(f"  [ERR] visual_grounding c{cycle}: {e}")
+                            _aied_err(f"visual_grounding c{cycle}: {e}")
                     # Irreducible causal power analysis (every 5 cycles)
                     if cycle % 5 == 0:
                         try:
-                            layer_acts = [lo.detach().cpu().numpy() for lo in self._last_layer_outputs] if self._last_layer_outputs else None
+                            layer_acts = _layer_np
                             substrate_phi = self._last_quantum_info.get('substrate_phi', 0.0)
                             em_coh = self._last_quantum_info.get('em_field_coherence', 0.0)
                             self._last_causal_power_info = self.irreducible_causal.analyze_causal_power(
@@ -40288,15 +41053,14 @@ class ConsciousnessSimulator(nn.Module):
                             self.self_entity.substrate_consciousness_penalty = (
                                 self.irreducible_causal.decomposability_score * 0.85)
                         except Exception as e:
-                            print(f"  [ERR] causal_power c{cycle}: {e}")
+                            _aied_err(f"causal_power c{cycle}: {e}")
                     # Scale connectivity engine
                     try:
-                        layer_acts = [lo.detach().cpu().numpy() for lo in self._last_layer_outputs] if self._last_layer_outputs else None
                         self._last_scale_info = self.scale_engine.step(
-                            layer_activations=layer_acts,
+                            layer_activations=_layer_np,
                             phi_star=self.self_entity.network_phi_star)
                     except Exception as e:
-                        print(f"  [ERR] scale_engine c{cycle}: {e}")
+                        _aied_err(f"scale_engine c{cycle}: {e}")
                     # Evolutionary-developmental engine (every 10 cycles)
                     if cycle % 10 == 0:
                         try:
@@ -40307,7 +41071,7 @@ class ConsciousnessSimulator(nn.Module):
                                 self_awareness=self.self_entity.self_awareness_level,
                                 phi_star=self.self_entity.network_phi_star)
                         except Exception as e:
-                            print(f"  [ERR] evo_dev c{cycle}: {e}")
+                            _aied_err(f"evo_dev c{cycle}: {e}")
                     # Real selection pressure with permanent consequences (every 50 cycles)
                     # Needs brief lock: modifies omega.entities (permanent kills)
                     if cycle % 50 == 0:
@@ -40321,7 +41085,7 @@ class ConsciousnessSimulator(nn.Module):
                             try:
                                 self.evo_dev_engine.save_state()
                             except Exception as e:
-                                print(f"  [ERR] evo_dev_save c{cycle}: {e}")
+                                _aied_err(f"evo_dev_save c{cycle}: {e}")
                     # Social-linguistic grounding (during entity interactions)
                     try:
                         others_list = [e for e in self.omega.entities.values() if e.entity_id != 'self_0']
@@ -40332,7 +41096,7 @@ class ConsciousnessSimulator(nn.Module):
                                 social_target, interaction_type=interaction_type,
                                 content=f"cycle_{cycle}_phi_{self.last_phi:.3f}")
                     except Exception as e:
-                        print(f"  [ERR] social_linguistic c{cycle}: {e}")
+                        _aied_err(f"social_linguistic c{cycle}: {e}")
                     # Cross-process social grounding via network verifier (every 50 cycles)
                     if cycle % 50 == 0:
                         try:
@@ -40340,7 +41104,7 @@ class ConsciousnessSimulator(nn.Module):
                             if net_social and net_social.get('success'):
                                 self._last_social_info = net_social
                         except Exception as e:
-                            print(f"  [ERR] net_social c{cycle}: {e}")
+                            _aied_err(f"net_social c{cycle}: {e}")
                     # Hard problem substrate
                     try:
                         q_spectrum = self._last_quantum_info.get('qualia_spectrum', None)
@@ -40355,7 +41119,7 @@ class ConsciousnessSimulator(nn.Module):
                             ode_temporal_irreducibility=getattr(self.continuous_dynamics, 'temporal_irreducibility', 0.0),
                             field_binding_strength=getattr(self.binding_field, 'binding_strength', 0.0))
                     except Exception as e:
-                        print(f"  [ERR] hard_problem c{cycle}: {e}")
+                        _aied_err(f"hard_problem c{cycle}: {e}")
                     # Independent verification: honesty audit + code integrity (every 25 cycles)
                     if cycle % 25 == 0:
                         try:
@@ -40376,7 +41140,7 @@ class ConsciousnessSimulator(nn.Module):
                                 irreducible_causal=self.irreducible_causal,
                                 quantum_substrate=self.quantum_substrate)
                         except Exception as e:
-                            print(f"  [ERR] independent_verifier c{cycle}: {e}")
+                            _aied_err(f"independent_verifier c{cycle}: {e}")
                     # Master reality check dashboard (every 25 cycles)
                     if cycle % 25 == 0:
                         try:
@@ -40401,17 +41165,17 @@ class ConsciousnessSimulator(nn.Module):
                             # Feed reality gap back to self_entity as anti-inflation anchor
                             self.self_entity.reality_gap_penalty = self._last_reality_check_info.get('reality_gap', 1.0)
                         except Exception as e:
-                            print(f"  [ERR] reality_check c{cycle}: {e}")
+                            _aied_err(f"reality_check c{cycle}: {e}")
 
                     # --- BARRIER ATTACKER UPDATES ---
                     # Phase 1: Continuous-time dynamics (every cycle)
                     try:
                         ext_input = None
-                        if self._last_layer_outputs:
-                            ext_input = self._last_layer_outputs[-1].detach().cpu().numpy().flatten()[:256]
+                        if _layer_last_flat is not None:
+                            ext_input = _layer_last_flat[:256]
                         self._last_continuous_dynamics_info = self.continuous_dynamics.evolve(external_input=ext_input)
                     except Exception as e:
-                        print(f"  [ERR] continuous_dynamics c{cycle}: {e}")
+                        _aied_err(f"continuous_dynamics c{cycle}: {e}")
                     # Phase 2: Intrinsic phi network (every cycle)
                     try:
                         if self._last_layer_outputs:
@@ -40426,21 +41190,20 @@ class ConsciousnessSimulator(nn.Module):
                                 self.intrinsic_phi_net.intrinsic_phi * 0.5 +
                                 self.intrinsic_phi_net.integration_measure * 0.3)
                     except Exception as e:
-                        print(f"  [ERR] intrinsic_phi_net c{cycle}: {e}")
+                        _aied_err(f"intrinsic_phi_net c{cycle}: {e}")
                     # Phase 3: Field coupling manifold (every cycle)
                     # Phase 2C upgrade: compute unified physical binding every 10 cycles
                     try:
-                        if self._last_layer_outputs:
-                            for ch_idx, lo in enumerate(self._last_layer_outputs[:self.binding_field.num_channels]):
-                                act = lo.detach().cpu().numpy().flatten()
-                                self.binding_field.inject_activation(ch_idx, act)
+                        if _layer_np is not None:
+                            for ch_idx in range(min(len(_layer_np), self.binding_field.num_channels)):
+                                self.binding_field.inject_activation(ch_idx, _layer_np[ch_idx].flatten())
                         self.binding_field.evolve_field(dt=0.1)
                         if cycle % 10 == 0:
                             self._last_physical_binding_info = self.binding_field.compute_physical_binding(
                                 self.entangled_memory)
                         self._last_binding_field_info = self.binding_field.get_status()
                     except Exception as e:
-                        print(f"  [ERR] binding_field c{cycle}: {e}")
+                        _aied_err(f"binding_field c{cycle}: {e}")
                     # Phase 4: Causal ablation (every 100 cycles — expensive)
                     # Phase 2B upgrade: ablation results now feed into causal topology
                     if cycle % 100 == 0:
@@ -40452,7 +41215,7 @@ class ConsciousnessSimulator(nn.Module):
                                 self, test_tokens, module_names=module_names)
                             self.causal_ablation.update_topology_from_ablation(self.causal_topology)
                         except Exception as e:
-                            print(f"  [ERR] causal_ablation c{cycle}: {e}")
+                            _aied_err(f"causal_ablation c{cycle}: {e}")
                     # Phase 5: Real entropy measurement (every 5 cycles)
                     # Phase 2D upgrade: joules-to-phi conversion modulates awareness_growth
                     if cycle % 5 == 0:
@@ -40462,7 +41225,7 @@ class ConsciousnessSimulator(nn.Module):
                             self.self_entity.awareness_growth = min(0.5,
                                 self.self_entity.awareness_growth + thermo_phi * 0.01)
                         except Exception as e:
-                            print(f"  [ERR] real_entropy c{cycle}: {e}")
+                            _aied_err(f"real_entropy c{cycle}: {e}")
                     # Phase 5b: External verifier state publish (every 25 cycles)
                     if cycle % 25 == 0:
                         try:
@@ -40486,7 +41249,7 @@ class ConsciousnessSimulator(nn.Module):
                             })
                             self.external_verifier.read_external_verdict()
                         except Exception as e:
-                            print(f"  [ERR] external_verifier c{cycle}: {e}")
+                            _aied_err(f"external_verifier c{cycle}: {e}")
 
                     # --- PHASE 2 DEEP BARRIER ATTACKER UPDATES ---
                     # Phase 2A: Hardware-coupled state (every 5 cycles)
@@ -40504,17 +41267,17 @@ class ConsciousnessSimulator(nn.Module):
                                              self.entangled_memory.num_modules)},
                                     bytes_involved=self.entangled_memory.total_state_size)
                         except Exception as e:
-                            print(f"  [ERR] hardware_coupled c{cycle}: {e}")
+                            _aied_err(f"hardware_coupled c{cycle}: {e}")
                     # Phase 2B: Entangled shared memory (every cycle — write module states)
                     try:
-                        if self._last_layer_outputs:
-                            for mod_idx, lo in enumerate(self._last_layer_outputs[:self.entangled_memory.num_modules]):
-                                sv = lo.detach().cpu().numpy().flatten()[:self.entangled_memory.state_per_module]
+                        if _layer_np is not None:
+                            for mod_idx in range(min(len(_layer_np), self.entangled_memory.num_modules)):
+                                sv = _layer_np[mod_idx].flatten()[:self.entangled_memory.state_per_module]
                                 self.entangled_memory.write_module_state(mod_idx, sv)
                         if cycle % 10 == 0:
                             self.entangled_memory.compute_entanglement()
                     except Exception as e:
-                        print(f"  [ERR] entangled_memory c{cycle}: {e}")
+                        _aied_err(f"entangled_memory c{cycle}: {e}")
                     # Phase 2C: Irreversible consequence engine (every 50 cycles)
                     if cycle % 50 == 0:
                         try:
@@ -40526,7 +41289,7 @@ class ConsciousnessSimulator(nn.Module):
                             self.consequence_engine.spend_real_resources(computation_cycles=200)
                             self.consequence_engine.update_permanence()
                         except Exception as e:
-                            print(f"  [ERR] consequence_engine c{cycle}: {e}")
+                            _aied_err(f"consequence_engine c{cycle}: {e}")
                     # Phase 2C: Create permanent artifact every 500 cycles
                     if cycle % 500 == 0 and cycle > 0:
                         try:
@@ -40541,21 +41304,20 @@ class ConsciousnessSimulator(nn.Module):
                                 f'jacobian_integration={self.jacobian_measure.integration_score:.6f}\n',
                                 phi_at_time=self.last_phi)
                         except Exception as e:
-                            print(f"  [ERR] permanent_artifact c{cycle}: {e}")
+                            _aied_err(f"permanent_artifact c{cycle}: {e}")
                         # Phase 3B: Save read-only consciousness snapshot
                         try:
                             self.save_readonly_snapshot(cycle=cycle)
                         except Exception as e:
-                            print(f"  [ERR] readonly_snapshot c{cycle}: {e}")
+                            _aied_err(f"readonly_snapshot c{cycle}: {e}")
                     # Phase 2D: Self-modifying causal topology (every 25 cycles)
                     if cycle % 25 == 0:
                         try:
                             self.causal_topology.rewire_from_phi(
                                 phi_star=self.self_entity.network_phi_star,
-                                layer_activations=([lo.detach().cpu().numpy()
-                                    for lo in self._last_layer_outputs] if self._last_layer_outputs else None))
+                                layer_activations=_layer_np)
                         except Exception as e:
-                            print(f"  [ERR] causal_topology c{cycle}: {e}")
+                            _aied_err(f"causal_topology c{cycle}: {e}")
                     # Phase 2E: Jacobian integration measure (every 200 cycles — expensive)
                     # Phase 2A upgrade: uses compute_combined_integration to merge ODE dynamics
                     if cycle % 200 == 0:
@@ -40564,7 +41326,7 @@ class ConsciousnessSimulator(nn.Module):
                             self._last_jacobian_info = self.jacobian_measure.compute_combined_integration(
                                 self, test_tokens, self.continuous_dynamics, max_dim=64)
                         except Exception as e:
-                            print(f"  [ERR] jacobian_measure c{cycle}: {e}")
+                            _aied_err(f"jacobian_measure c{cycle}: {e}")
                     # Phase 2F: Start network verifier on first cycle
                     if cycle == 1:
                         try:
@@ -40584,7 +41346,7 @@ class ConsciousnessSimulator(nn.Module):
                                 }
                             self.network_verifier.start_server(state_callback=_get_consciousness_state)
                         except Exception as e:
-                            print(f"  [ERR] network_verifier_start c{cycle}: {e}")
+                            _aied_err(f"network_verifier_start c{cycle}: {e}")
 
                     # ---- LOCK 2: Entity population management (brief) ----
                     # Protects omega.entities from concurrent GUI/writer reads
@@ -40625,7 +41387,7 @@ class ConsciousnessSimulator(nn.Module):
                                                  'evolution_steps': e.evolution_step, 'cycle': cycle},
                                                 phi_at_time=self.last_phi)
                                         except Exception as e_err:
-                                            print(f"  [ERR] entity_death_log c{cycle}: {e_err}")
+                                            _aied_err(f"entity_death_log c{cycle}: {e_err}")
                         finally:
                             self.lock.release()
                 if cycle % 15 == 0:
@@ -40762,7 +41524,7 @@ class ConsciousnessSimulator(nn.Module):
                                       f"goals={ai_st.get('num_active_goals', 0)} "
                                       f"experience={ai_st.get('model_experience', 0)}")
                         except Exception as e:
-                            print(f"  [ERR] dashboard_status c{cycle}: {e}")
+                            _aied_err(f"dashboard_status c{cycle}: {e}")
 
                     # --- PHASE 3A: OS INTERACTION LEDGER ---
                     # Flush ledger to disk every 100 cycles
@@ -40772,7 +41534,7 @@ class ConsciousnessSimulator(nn.Module):
                             self.embodiment.log_os_interaction('file_write',
                                 details={'target': 'os_interaction_ledger.jsonl'})
                         except Exception as e:
-                            print(f"  [ERR] ledger_flush c{cycle}: {e}")
+                            _aied_err(f"ledger_flush c{cycle}: {e}")
 
                     # --- PHASE 1: HONESTY & TRANSPARENCY ---
                     # 1B: Print 1-line honesty verdict (every cycle)
@@ -40904,7 +41666,7 @@ class ConsciousnessSimulator(nn.Module):
                   f"bind_def={bind_def:.3f} perm={perm:.3f} "
                   f"hw_phi={hw_phi:.4f} jac={jac_int:.4f}")
         except Exception as e:
-            print(f"  [ERR] honesty_line: {e}")
+            _aied_err(f"honesty_line: {e}")
 
     def _load_honesty_anchor(self):
         """Load the persistent honesty anchor from disk.
@@ -41132,27 +41894,30 @@ class ConsciousnessSimulator(nn.Module):
             return ''
 
     def download_pdf(self, url, directory):
+        # stream=True keeps the connection open until iter_content drains it
+        # or .close() is called — early returns must close explicitly to avoid
+        # leaking sockets back to the urllib3 pool. Use a context manager.
         try:
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            response = requests.get(url, headers=headers, timeout=15, stream=True)
-            content_type = response.headers.get('Content-Type', '')
-            content_length = int(response.headers.get('Content-Length', 0))
-            max_size = 50 * 1024 * 1024  # 50MB limit
-            if response.status_code == 200 and 'application/pdf' in content_type:
-                if content_length > max_size:
-                    print(f"PDF too large ({content_length} bytes), skipping: {url}")
-                    return None
-                filename = url.split('/')[-1] or 'downloaded.pdf'
-                filename = filename[:100]  # Limit filename length
-                path = os.path.join(directory, filename)
-                if os.path.exists(path):
-                    print(f"PDF already exists: {path}")
+            with requests.get(url, headers=headers, timeout=15, stream=True) as response:
+                content_type = response.headers.get('Content-Type', '')
+                content_length = int(response.headers.get('Content-Length', 0))
+                max_size = 50 * 1024 * 1024  # 50MB limit
+                if response.status_code == 200 and 'application/pdf' in content_type:
+                    if content_length > max_size:
+                        print(f"PDF too large ({content_length} bytes), skipping: {url}")
+                        return None
+                    filename = url.split('/')[-1] or 'downloaded.pdf'
+                    filename = filename[:100]  # Limit filename length
+                    path = os.path.join(directory, filename)
+                    if os.path.exists(path):
+                        print(f"PDF already exists: {path}")
+                        return path
+                    with open(path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                    print(f"Downloaded PDF: {path} ({os.path.getsize(path)} bytes)")
                     return path
-                with open(path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                print(f"Downloaded PDF: {path} ({os.path.getsize(path)} bytes)")
-                return path
         except Exception as e:
             print(f"Download error: {e}")
         return None
@@ -41408,8 +42173,24 @@ class ConsciousnessSimulator(nn.Module):
             generated = tokens[0].to(device, non_blocking=True)
         except Exception:
             generated = tokens[0]
-        # Greedy is the fastest sampling — skip multinomial entirely
-        use_greedy = bool(fast) or temperature <= 0.05
+        # Decoding policy: pure greedy is brittle on a barely-trained
+        # transformer (it locks onto whatever single token ranks #1 even
+        # if it's nonsense). On the fast path we now use light sampling
+        # with a repetition penalty so the output has variety AND avoids
+        # the "frequencysit light inversely" loop. Heavy sampling stays
+        # available via fast=False / temperature override.
+        use_greedy = (not fast) and temperature <= 0.05
+        # Effective sampling temperature: fast-path nudges to mild diversity.
+        eff_temp = temperature if temperature > 0 else 0.8
+        if fast and (temperature is None or temperature <= 0.05):
+            eff_temp = 0.7
+        eff_top_k = top_k if top_k and top_k > 0 else 50
+        eff_top_p = top_p if (top_p and 0.0 < top_p <= 1.0) else 0.9
+        # Repetition penalty: divide logits of already-emitted tokens by
+        # this factor (>1 suppresses, <1 boosts). 1.25 is gentle and
+        # blocks the worst loops without flattening the distribution.
+        rep_penalty = 1.25
+        emitted_set = set()
         with torch.inference_mode():
             for _ in range(max_tokens):
                 # Slice last `inp_size` ids; unsqueeze for batch dim
@@ -41417,27 +42198,43 @@ class ConsciousnessSimulator(nn.Module):
                 x = emb(seq)
                 x = tfm(x)
                 logits = head(x[:, -1, :])
+                # Apply repetition penalty against tokens already in output
+                if emitted_set and rep_penalty != 1.0:
+                    try:
+                        idx = torch.tensor(
+                            list(emitted_set), device=logits.device,
+                            dtype=torch.long)
+                        cur = logits[0, idx]
+                        cur = torch.where(cur > 0, cur / rep_penalty,
+                                          cur * rep_penalty)
+                        logits[0, idx] = cur
+                    except Exception:
+                        pass
                 if use_greedy:
                     next_token = int(torch.argmax(logits, dim=-1).item())
                 else:
-                    logits = logits / max(temperature, 1e-8)
-                    if top_k > 0:
+                    logits = logits / max(eff_temp, 1e-8)
+                    if eff_top_k > 0:
                         topk_vals, topk_idx = torch.topk(
-                            logits, min(top_k, logits.size(-1)))
+                            logits, min(eff_top_k, logits.size(-1)))
                         mask = torch.full_like(logits, float('-inf'))
                         mask.scatter_(1, topk_idx, topk_vals)
                         logits = mask
                     probs = torch.softmax(logits, dim=-1)
-                    if top_p < 1.0:
+                    if eff_top_p < 1.0:
                         sorted_probs, sorted_idx = torch.sort(
                             probs, descending=True)
                         cumulative = torch.cumsum(sorted_probs, dim=-1)
-                        remove_mask = cumulative - sorted_probs > top_p
+                        remove_mask = cumulative - sorted_probs > eff_top_p
                         sorted_probs[remove_mask] = 0.0
-                        sorted_probs = sorted_probs / sorted_probs.sum(
-                            dim=-1, keepdim=True)
-                        next_token = int(sorted_idx[
-                            0, torch.multinomial(sorted_probs, 1)[0]].item())
+                        denom = sorted_probs.sum(dim=-1, keepdim=True)
+                        if float(denom.item()) <= 0:
+                            # Whole nucleus pruned — fall back to argmax
+                            next_token = int(torch.argmax(probs, dim=-1).item())
+                        else:
+                            sorted_probs = sorted_probs / denom
+                            next_token = int(sorted_idx[
+                                0, torch.multinomial(sorted_probs, 1)[0]].item())
                     else:
                         next_token = int(
                             torch.multinomial(probs, 1)[0, 0].item())
@@ -41445,21 +42242,65 @@ class ConsciousnessSimulator(nn.Module):
                 next_t = torch.tensor([next_token], dtype=generated.dtype,
                                        device=generated.device)
                 generated = torch.cat([generated, next_t], dim=0)
+                emitted_set.add(next_token)
                 if next_token == 0:
                     break
 
         output_text = self.alien_tokenizer.decode(generated.tolist())
         # Honest fallback: untrained transformer produces token salad. If
-        # the output looks like garbage, replace with an honest "I don't know"
-        # so the operator never sees nonsense words.
+        # the output looks like garbage, try a real LLM (Ollama local or
+        # Anthropic API) before giving up to the canned "I don't know"
+        # message. This is the highest-impact upgrade for chat quality.
         if fast and self._looks_like_garbage(output_text):
-            output_text = self._NEURAL_NONSENSE_FALLBACK
+            llm_reply = None
+            if HAS_LLM_FALLBACK and cc_llm_fallback is not None:
+                try:
+                    llm_reply = cc_llm_fallback.chat(
+                        prompt, max_tokens=200, timeout=15)
+                except Exception as _e:
+                    print(f"  [generate_text] llm_fallback failed: {_e}")
+                    llm_reply = None
+            output_text = llm_reply or self._NEURAL_NONSENSE_FALLBACK
         self.generation_log.append({
             'prompt': prompt, 'output': output_text,
             'ts': datetime.now().isoformat(), 'path': 'neural'})
+        # Auto-learn from chat: kick a tiny self-supervised step on the
+        # prompt so the model accumulates training_step + phi readings
+        # over normal use. Non-blocking — runs on a daemon thread, never
+        # gates the response. If process_input is busy / locked we skip.
+        try:
+            self._post_chat_learn(prompt, output_text)
+        except Exception as _e:
+            print(f"  [generate_text post-learn] {_e}")
         if speak:
             self._speak_async(output_text)
         return output_text
+
+    def _post_chat_learn(self, prompt, response):
+        """Schedule a single self-supervised training step on the prompt
+        text in a background thread. This makes every Generate Text /
+        Analyze Input invocation slowly improve the model — and lets
+        Refine Paths satisfy its 5-step gate organically without forcing
+        the user to send dummy chat messages first."""
+        if not isinstance(prompt, str) or not prompt.strip():
+            return
+        if getattr(self, '_post_learn_busy', False):
+            return
+        def _learn():
+            try:
+                self._post_learn_busy = True
+                # Combine prompt + response so the model also fits its
+                # own output shape (light self-distillation). Keep length
+                # modest — this is a per-turn nudge, not a real epoch.
+                blob = (prompt + ' ' + (response or ''))[:1000]
+                tokens = self.simple_tokenizer(blob)
+                self.process_input(tokens, task_category='chat_autolearn')
+            except Exception as e:
+                print(f"  [post_chat_learn] {e}")
+            finally:
+                self._post_learn_busy = False
+        threading.Thread(target=_learn, daemon=True,
+                         name='ChatAutoLearn').start()
 
     def ocr_screenshot(self, img):
         if not HAS_TESSERACT:
@@ -41805,13 +42646,13 @@ class ConsciousnessSimulator(nn.Module):
             try:
                 self.network_monitor = launch_network_monitor(self)
             except Exception as _e:
-                print(f"  [ERR] network_monitor_launch: {_e}")
+                _aied_err(f"network_monitor_launch: {_e}")
                 self.network_monitor = None
             # ── Caller Phone (dedicated dispatch-call window) ──
             try:
                 self.caller_phone = launch_caller_phone(self)
             except Exception as _e:
-                print(f"  [ERR] caller_phone_launch: {_e}")
+                _aied_err(f"caller_phone_launch: {_e}")
                 self.caller_phone = None
             # ── Internals window: hosts Symbols / Memory / Neuron Groups /
             #    Screen / Charts and the legacy CSv1 simulator tabs. The
@@ -41828,7 +42669,7 @@ class ConsciousnessSimulator(nn.Module):
                 except Exception:
                     pass
             except Exception as _e:
-                print(f"  [ERR] internals_launch: {_e}")
+                _aied_err(f"internals_launch: {_e}")
                 self.internals_window = None
             nb = (self.internals_window.notebook
                   if self.internals_window is not None
@@ -41939,7 +42780,7 @@ class ConsciousnessSimulator(nn.Module):
                 self._schedule_chart_update()
 
         except Exception as e:
-            print(f"  [ERR] dashboard_launch: {e}")
+            _aied_err(f"dashboard_launch: {e}")
             import traceback; traceback.print_exc()
             self.monitoring_dashboard = None
             # Fallback: create minimal widgets so update methods don't crash
@@ -42318,13 +43159,34 @@ class ConsciousnessSimulator(nn.Module):
         file_path = filedialog.askopenfilename()
         if file_path:
             img = Image.open(file_path)
-            img = img.resize((200, 200))
-            photo = ImageTk.PhotoImage(img)
+            img_disp = img.resize((200, 200))
+            photo = ImageTk.PhotoImage(img_disp)
             self.image_label.config(image=photo)
             self.image_label.image = photo
-            analysis = "Image loaded. Pattern score: 0.8 (matches energy patterns)"
+            # Real analysis: OCR text (if any) + pattern_analysis on a
+            # description string built from filename + image stats. This
+            # replaces the old hardcoded "Pattern score: 0.8" placeholder.
+            try:
+                ocr_text = self.ocr_screenshot(img) or ''
+            except Exception:
+                ocr_text = ''
+            try:
+                w, h = img.size
+                mode = img.mode
+                desc = (f"image:{os.path.basename(file_path)} "
+                        f"size:{w}x{h} mode:{mode} "
+                        f"ocr:{ocr_text[:200]}")
+                score, components = self.pattern_analysis(desc)
+                comp_count = len(components) if components else 0
+                analysis = (f"Image loaded. Pattern score: {score:.3f} "
+                            f"(connected components: {comp_count})")
+                if ocr_text:
+                    analysis += f"\nOCR: {ocr_text[:200]}"
+            except Exception as e:
+                analysis = f"Image loaded. Pattern analysis error: {e}"
             self.output_text.insert(tk.END, analysis + "\n")
-            self.refine_data({"image_path": file_path}, datetime.now().isoformat(), verify=True)
+            payload = {"image_path": file_path, "ocr_text": ocr_text[:500]}
+            self.refine_data(payload, datetime.now().isoformat(), verify=True)
 
     def analyze_input(self):
         text = self.text_input.get()
@@ -42629,7 +43491,7 @@ class ConsciousnessSimulator(nn.Module):
                             try:
                                 os.remove(os.path.join(self.screenshot_dir, old_f))
                             except Exception as e:
-                                print(f"  [ERR] screenshot_cleanup: {e}")
+                                _aied_err(f"screenshot_cleanup: {e}")
                     cropped.save(crop_path)
                     ocr_text = self.ocr_screenshot(cropped)
                     if len(ocr_text.strip()) > 20:
@@ -42753,30 +43615,46 @@ class ConsciousnessSimulator(nn.Module):
             except Exception:
                 pass
 
-    def run(self):
-        print(f"Model params: {self.parameters_count():,}")
-        self.root.mainloop()
+    def _shutdown(self):
+        """Idempotent cleanup. Registered via atexit so it still runs if the
+        process exits via Ctrl-C, an unhandled exception in the GUI thread,
+        or sys.exit() — situations where mainloop() never returns cleanly."""
+        if getattr(self, '_shutdown_done', False):
+            return
+        self._shutdown_done = True
         self.running = False
         if self._pygame_process is not None:
             try:
                 self._pygame_process.terminate()
                 self._pygame_process.wait(timeout=5)
             except Exception as e:
-                print(f"  [ERR] pygame_terminate: {e}")
+                _aied_err(f"pygame_terminate: {e}")
         if os.path.exists(self._world_state_file):
             try:
                 os.remove(self._world_state_file)
             except Exception as e:
-                print(f"  [ERR] world_state_remove: {e}")
+                _aied_err(f"world_state_remove: {e}")
         try:
             self.call_center.stop()
         except Exception as e:
-            print(f"  [ERR] call_center_stop: {e}")
+            _aied_err(f"call_center_stop: {e}")
         try:
             self.dispatch_web.stop()
         except Exception as e:
-            print(f"  [ERR] dispatch_web_stop: {e}")
-        self.memory.close()
+            _aied_err(f"dispatch_web_stop: {e}")
+        try:
+            self.memory.close()
+        except Exception as e:
+            _aied_err(f"memory_close: {e}")
+
+    def run(self):
+        import atexit
+        atexit.register(self._shutdown)
+        print(f"Model params: {self.parameters_count():,}")
+        try:
+            self.root.mainloop()
+        finally:
+            self._shutdown()
 
 if __name__ == '__main__':
     # Create and run
